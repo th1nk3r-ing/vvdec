@@ -640,6 +640,37 @@ vvdecSEI* VVDecImpl::findFrameSei( vvdecSEIPayloadType payloadType, vvdecFrame *
 }
 
 
+const Picture* VVDecImpl::getPictureFromFrame( const vvdecFrame* frame ) const
+{
+  if( !m_bInitialized ) { return nullptr; }
+  if( nullptr == frame ) { return nullptr; }
+
+  for( auto& entry : m_rcFrameList )
+  {
+    if( frame == &std::get<vvdecFrame>( entry ) )
+    {
+      return std::get<Picture*>( entry );
+    }
+  }
+  return nullptr;
+}
+
+Picture* VVDecImpl::getPictureFromFrame( const vvdecFrame* frame )
+{
+  if( !m_bInitialized ) { return nullptr; }
+  if( nullptr == frame ) { return nullptr; }
+
+  for( auto& entry : m_rcFrameList )
+  {
+    if( frame == &std::get<vvdecFrame>( entry ) )
+    {
+      return std::get<Picture*>( entry );
+    }
+  }
+  return nullptr;
+}
+
+
 int VVDecImpl::objectUnref( vvdecFrame* pcFrame )
 {
   if( !m_bInitialized ){ return VVDEC_ERR_INITIALIZE; }

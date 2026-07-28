@@ -71,6 +71,8 @@ set( VVDEC_WRITE_INPUT_BITSTREAM FALSE                 CACHE BOOL "Write input b
 
 set( VVDEC_ENABLE_UNSTABLE_API OFF                     CACHE BOOL "Enable unstable API (include 3.0.0 API and ABI incompatible interface extensions)" )
 
+set( VVDEC_ENABLE_INTERNALS      ON                      CACHE BOOL "Enable internals API (vvdec_internals_*) for coding-structure analysis (CTU/CU/PU/TU/IntraDir/MV statistics)" )
+
 set( VVDEC_USE_UNSTABLE_API 0 )
 if( VVDEC_ENABLE_UNSTABLE_API )
   set( VVDEC_USE_UNSTABLE_API 1 )

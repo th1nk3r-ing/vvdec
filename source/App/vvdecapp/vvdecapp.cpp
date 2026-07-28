@@ -48,6 +48,7 @@ POSSIBILITY OF SUCH DAMAGE.
 #include <stdio.h>
 #include <fstream>
 #include <string.h>
+#include <cstring>
 #include <chrono>
 #include <thread>
 
@@ -445,8 +446,22 @@ void printSEI( vvdecDecoder *dec, vvdecFrame *frame, std::ostream * logStream )
   }
 }
 
+#if defined(__has_feature)
+#  if __has_feature(memory_sanitizer)
+extern "C" void __msan_unpoison( const volatile void*, size_t );
+#  endif
+#endif
+
 int main( int argc, char* argv[] )
 {
+#if defined(__has_feature)
+#  if __has_feature(memory_sanitizer)
+  for( int i = 0; i < argc; ++i )
+  {
+    __msan_unpoison( argv[i], std::strlen( argv[i] ) + 1 );
+  }
+#  endif
+#endif
   std::string cAppname = argv[0];
   std::size_t iPos = (int)cAppname.find_last_of("/");
   if( std::string::npos != iPos )

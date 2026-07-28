@@ -651,7 +651,13 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
         param->decLib->swapBufs( cs );
       }
 
+      // When the internals API is enabled, defer deallocTempInternals to
+      // CodingStructure::resetForUse so that coding-structure data (CU/TU
+      // objects, cuMap) remains valid for analysis while the application
+      // holds the frame (lockedByApplication).
+#ifndef VVDEC_INTERNALS_ENABLED
       cs.deallocTempInternals();
+#endif
 
 #ifdef TRACE_ENABLE_ITT
       // mark end of frame

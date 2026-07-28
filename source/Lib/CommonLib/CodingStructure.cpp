@@ -113,6 +113,14 @@ void CodingStructure::resetForUse()
   std::fill( std::begin( alfApss ), std::end( alfApss ), nullptr );
   lmcsAps.reset();
   pcv = nullptr;
+
+  // When the internals API is enabled, deallocTempInternals was deferred from
+  // finishReconTask to here, so coding-structure data stays valid while the
+  // application holds the frame. Release it now that the Picture is being
+  // recycled.
+#ifdef VVDEC_INTERNALS_ENABLED
+  deallocTempInternals();
+#endif
 }
 
 CodingUnit& CodingStructure::addCU( const UnitArea &unit, const ChannelType chType, const TreeType treeType, const ModeType modeType, const CodingUnit *cuLeft, const CodingUnit *cuAbove )
