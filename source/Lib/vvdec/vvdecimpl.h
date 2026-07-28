@@ -149,7 +149,14 @@ public:
 
   int flush( vvdecFrame** ppcFrame );
 
-  vvdecSEI* findFrameSei( vvdecSEIPayloadType payloadType, vvdecFrame *frame );
+  vvdecSEI* findFrameSei( vvdecSEIPayloadType seiPayloadType, vvdecFrame *frame );
+
+  // internals API (vvdec_internals_*): look up the internal Picture* backing a
+  // publicly returned vvdecFrame*. Returns nullptr if the frame is not found in
+  // the internal frame list (e.g. already unreffed). Only valid to call after
+  // vvdec_decode/vvdec_flush returned the frame and before vvdec_frame_unref.
+  const Picture* getPictureFromFrame( const vvdecFrame* frame ) const;
+  Picture*       getPictureFromFrame( const vvdecFrame* frame );
 
   int objectUnref( vvdecFrame* pframe );
 
