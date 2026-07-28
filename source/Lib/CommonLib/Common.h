@@ -74,6 +74,11 @@ struct Position
   constexpr Position operator-( const Position &other )         const { return{ x - other.x, y - other.y }; }
 };
 
+// MSVC /O2 /Ob2 miscompiles inline access to the 30-bit height bitfield;
+// disable optimization for this struct on MSVC.
+#ifdef _MSC_VER
+#pragma optimize("", off)
+#endif
 struct Size
 {
   SizeType width   : 32;
@@ -89,6 +94,9 @@ struct Size
 
   const     ComponentID compID()                    const { return ComponentID( _compID ); }
 };
+#ifdef _MSC_VER
+#pragma optimize("", on)
+#endif
 
 struct Area : public Position, public Size
 {
