@@ -189,6 +189,21 @@ Picture* DecLib::decode( InputNALUnit& nalu )
     newPic = m_decLibParser.parse( nalu );
   }
 
+  // Header-only mode: the slice header, reference picture lists and DPB have
+  // been updated by parse(). Skip reconstruction and output-picture draining
+  // entirely -- no vvdecFrame is produced. Drain the parse frame list so it
+  // doesn't grow unboundedly (the pictures themselves stay alive in the
+  // parser's dpbReferencePics until marking removes them).
+  if( m_headerOnly )
+  {
+    while( m_decLibParser.getNextDecodablePicture() ) {}
+    if( newPic )
+    {
+      msg( VERBOSE, "header-only: decode() returning nullptr (no reconstruction), POC drained\n" );
+    }
+    return nullptr;
+  }
+
   if( newPic )
   {
     Picture* pcParsedPic = m_decLibParser.getNextDecodablePicture();

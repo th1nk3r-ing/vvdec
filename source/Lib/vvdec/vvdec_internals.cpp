@@ -607,6 +607,100 @@ int vvdec_internals_get_gop_info_dec( vvdecDecoder *dec,
 }
 
 /* ===========================================================================
+ * GOP info (header-only) — extract GOP metadata for the most recently
+ * completed header-only-parsed picture, without any decoded frame.
+ * =========================================================================== */
+int vvdec_internals_get_gop_info_headeronly( vvdecDecoder *dec,
+                                             int *poc,
+                                             int *temporalLayer,
+                                             int *sliceType,
+                                             int *nalUnitType,
+                                             int *isRAP,
+                                             int *allSlicesIntra,
+                                             int *numRefPocL0,
+                                             int *numRefPocL1,
+                                             int refPocL0[16],
+                                             int refPocL1[16] )
+{
+  auto* impl = implFromDecoder( dec );
+  if( !impl )
+  {
+    return VVDEC_ERR_INITIALIZE;
+  }
+  const vvdec::Picture* pic = impl->getLastParsedPic();
+  if( !pic || pic->slices.empty() )
+  {
+    vvdec::msg( vvdec::WARNING, "vvdec_internals_get_gop_info_headeronly: no parsed picture available yet\n" );
+    return VVDEC_ERR_INITIALIZE;
+  }
+  const vvdec::Slice* slice = pic->slices.front();
+  if( !slice )
+  {
+    vvdec::msg( vvdec::WARNING, "vvdec_internals_get_gop_info_headeronly: first slice is null\n" );
+    return VVDEC_ERR_INITIALIZE;
+  }
+  if( poc )
+  {
+    *poc = pic->poc;
+  }
+  if( temporalLayer )
+  {
+    *temporalLayer = (int) slice->getTLayer();
+  }
+  if( sliceType )
+  {
+    // VVC: B_SLICE=0, P_SLICE=1, I_SLICE=2
+    *sliceType = (int) slice->getSliceType();
+  }
+  if( nalUnitType )
+  {
+    *nalUnitType = (int) slice->getNalUnitType();
+  }
+  if( isRAP )
+  {
+    *isRAP = slice->isIRAP() ? 1 : 0;
+  }
+  if( allSlicesIntra )
+  {
+    bool allIntra = true;
+    for( const vvdec::Slice* s : pic->slices )
+    {
+      if( !s || s->getSliceType() != vvdec::I_SLICE )
+      {
+        allIntra = false;
+        break;
+      }
+    }
+    *allSlicesIntra = allIntra ? 1 : 0;
+  }
+  if( numRefPocL0 )
+  {
+    *numRefPocL0 = (int) slice->getNumRefIdx( vvdec::REF_PIC_LIST_0 );
+  }
+  if( numRefPocL1 )
+  {
+    *numRefPocL1 = (int) slice->getNumRefIdx( vvdec::REF_PIC_LIST_1 );
+  }
+  if( refPocL0 )
+  {
+    const int n = std::min( (int) slice->getNumRefIdx( vvdec::REF_PIC_LIST_0 ), 16 );
+    for( int i = 0; i < 16; i++ )
+    {
+      refPocL0[i] = ( i < n ) ? slice->getRefPOC( vvdec::REF_PIC_LIST_0, i ) : 0;
+    }
+  }
+  if( refPocL1 )
+  {
+    const int n = std::min( (int) slice->getNumRefIdx( vvdec::REF_PIC_LIST_1 ), 16 );
+    for( int i = 0; i < 16; i++ )
+    {
+      refPocL1[i] = ( i < n ) ? slice->getRefPOC( vvdec::REF_PIC_LIST_1, i ) : 0;
+    }
+  }
+  return VVDEC_OK;
+}
+
+/* ===========================================================================
  * Image DTS
  * =========================================================================== */
 

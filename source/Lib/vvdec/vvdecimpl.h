@@ -149,6 +149,14 @@ public:
 
   int flush( vvdecFrame** ppcFrame );
 
+  // Header-only decode: parse slice headers, build reference picture lists and
+  // maintain the DPB, but skip CABAC slice body parsing and reconstruction.
+  // No vvdecFrame is produced (ppcFrame is set to nullptr). Use
+  // getLastParsedPicGOP() to extract GOP metadata for the most recently
+  // completed picture. Returns VVDEC_OK on success, VVDEC_TRY_AGAIN when an
+  // access unit contained no complete picture yet.
+  int decodeHeaderOnly( vvdecAccessUnit& accessUnit, vvdecFrame** ppcFrame );
+
   vvdecSEI* findFrameSei( vvdecSEIPayloadType seiPayloadType, vvdecFrame *frame );
 
   // internals API (vvdec_internals_*): look up the internal Picture* backing a
@@ -157,6 +165,11 @@ public:
   // vvdec_decode/vvdec_flush returned the frame and before vvdec_frame_unref.
   const Picture* getPictureFromFrame( const vvdecFrame* frame ) const;
   Picture*       getPictureFromFrame( const vvdecFrame* frame );
+
+  // Header-only mode: peek the most recently completed parsed picture.
+  // Returns nullptr until the first picture's last slice has been parsed.
+  // The pointer is valid until the next decodeHeaderOnly() call.
+  const Picture* getLastParsedPic() const { return m_cDecLib ? m_cDecLib->getLastParsedPic() : nullptr; }
 
   int objectUnref( vvdecFrame* pframe );
 
