@@ -607,6 +607,21 @@ VVDEC_DECL int vvdec_set_logging_callback(vvdecDecoder*, vvdecLoggingCallback ca
 */
 VVDEC_DECL int vvdec_decode( vvdecDecoder *, vvdecAccessUnit *accessUnit, vvdecFrame **frame );
 
+/* vvdec_decode_headeronly
+   This method parses only the slice headers of a compressed image packet
+   (bitstream): it builds reference picture lists and maintains the DPB, but
+   skips CABAC slice body parsing and picture reconstruction. No vvdecFrame is
+   produced (frame is always set to NULL). Use
+   vvdec_internals_get_gop_info_headeronly() to extract GOP metadata (POC, NAL
+   type, reference POCs) for the most recently completed picture.
+   \param[in]   vvdecDecoder pointer of decoder handler
+   \param[in]   vvdecAccessUnit_t pointer of AccessUnit that retrieves compressed access units and side information
+   \param[out]  vvdecFrame pointer to pointer of frame structure (always NULL)
+   \retval      int if non-zero an error occurred, otherwise VVDEC_OK
+   \pre         The decoder has to be initialized successfully.
+*/
+VVDEC_DECL int vvdec_decode_headeronly( vvdecDecoder *, vvdecAccessUnit *accessUnit, vvdecFrame **frame );
+
 /* vvdec_flush
   This method flushes the decoder.
   This call is used to get outstanding pictures after all compressed packets have been passed over into the decoder using the decode call.

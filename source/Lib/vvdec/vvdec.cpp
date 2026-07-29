@@ -295,6 +295,25 @@ VVDEC_DECL int vvdec_decode( vvdecDecoder *dec, vvdecAccessUnit* accessUnit, vvd
 }
 
 
+VVDEC_DECL int vvdec_decode_headeronly( vvdecDecoder *dec, vvdecAccessUnit* accessUnit, vvdecFrame** frame )
+{
+  *frame = nullptr;
+
+  auto d = (vvdec::VVDecImpl*)dec;
+  if (!d)
+  {
+    return VVDEC_ERR_INITIALIZE;
+  }
+
+  if( nullptr == accessUnit )
+  {
+    return d->setAndRetErrorMsg( VVDEC_ERR_DEC_INPUT, "no access unit provided (null)" );
+  }
+
+  return d->catchExceptions( &vvdec::VVDecImpl::decodeHeaderOnly, *accessUnit, frame );
+}
+
+
 VVDEC_DECL int vvdec_flush( vvdecDecoder *dec, vvdecFrame **frame )
 {
   *frame = nullptr;

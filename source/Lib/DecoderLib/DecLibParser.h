@@ -128,6 +128,15 @@ private:
   int                       m_maxPicReconSkip = 1;
   ErrHandlingFlags          m_errHandlingFlags = ERR_HANDLING_OFF;
 
+  // Header-only mode: parse slice headers, build reference picture lists and
+  // maintain the DPB, but skip the CABAC slice body (parseSlice) and any
+  // reconstruction. Used by the GOP-structure scanning API which only needs
+  // POC / NAL type / reference POC metadata.
+  bool                      m_headerOnly = false;
+  // Most recently completed parsed picture (set when the last slice of a
+  // picture is parsed). Valid for header-only GOP extraction. Not owned.
+  Picture*                  m_lastParsedPic = nullptr;
+
   CUChunkCache              m_cuChunkCache;
   TUChunkCache              m_tuChunkCache;
 
@@ -144,6 +153,14 @@ public:
 
   bool     parse                ( InputNALUnit& nalu );
   Picture* getNextDecodablePicture();
+
+  void     setHeaderOnly        ( bool v )              { m_headerOnly = v; }
+  bool     isHeaderOnly         () const                { return m_headerOnly; }
+  // Peek the most recently completed parsed picture (header-only mode).
+  // Returns nullptr until the first picture's last slice has been parsed.
+  // The pointer is valid until the next call to parse(); the caller must not
+  // retain it across decode calls.
+  const Picture* getLastParsedPic() const               { return m_lastParsedPic; }
 
   void checkNoOutputPriorPics   ();
   void setNoOutputPriorPicsFlag (bool val)              { m_isNoOutputPriorPics = val; }

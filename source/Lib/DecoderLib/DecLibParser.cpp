@@ -987,7 +987,19 @@ bool DecLibParser::xDecodeSliceMain( InputNALUnit& nalu )
   auto expected = Picture::init;
   m_pcParsePic->progress.compare_exchange_strong( expected, Picture::parsing );   // if RECO_WHILE_PARSE reconstruction can already have started, so we make sure to not overwrite that state
 
-  if( m_threadPool && m_threadPool->numThreads() > 0 )
+  if( m_headerOnly )
+  {
+    // Header-only mode: skip the CABAC slice body (parseSlice). The slice
+    // header, reference picture lists and DPB management have already been
+    // handled above. Just release the parse barrier so dependents (and the
+    // picture-completion check below) don't block.
+    msg( VERBOSE, "header-only: skip parseSlice for POC %d (slice %u)\n", m_pcParsePic->poc, m_uiSliceSegmentIdx );
+    pcSlice->parseDone.unlock();
+    // Mark progress as parsed so downstream state queries are consistent.
+    auto exp2 = Picture::parsing;
+    m_pcParsePic->progress.compare_exchange_strong( exp2, Picture::parsed );
+  }
+  else if( m_threadPool && m_threadPool->numThreads() > 0 )
   {
     if( m_uiSliceSegmentIdx > 0 )
     {
@@ -1027,6 +1039,11 @@ bool DecLibParser::xDecodeSliceMain( InputNALUnit& nalu )
   const unsigned lastCtuInSlice = pcSlice->getCtuAddrInSlice( pcSlice->getNumCtuInSlice() - 1 );
   if( lastCtuInSlice == pcSlice->getPPS()->pcv->sizeInCtus - 1 )
   {
+    if( m_headerOnly )
+    {
+      m_lastParsedPic = m_pcParsePic;
+      msg( VERBOSE, "header-only: picture complete POC %d\n", m_pcParsePic->poc );
+    }
     return true;
   }
 

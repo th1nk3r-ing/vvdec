@@ -601,6 +601,165 @@ int VVDecImpl::flush( vvdecFrame** ppframe )
   return iRet;
 }
 
+int VVDecImpl::decodeHeaderOnly( vvdecAccessUnit& rcAccessUnit, vvdecFrame** ppcFrame )
+{
+  *ppcFrame = nullptr;
+
+  if( !m_bInitialized )      { return VVDEC_ERR_INITIALIZE; }
+  if( m_eState == INTERNAL_STATE_RESTART_REQUIRED ) { m_cErrorString = "restart required, please reinit."; return VVDEC_ERR_RESTART_REQUIRED; }
+  if( m_eState == INTERNAL_STATE_NOT_SUPPORTED )    { m_cErrorString = "not supported feature detected."; return VVDEC_ERR_NOT_SUPPORTED; }
+
+  if( m_eState == INTERNAL_STATE_FINALIZED || m_eState == INTERNAL_STATE_FLUSHING )
+  {
+    reset();
+  }
+
+  if( m_eState == INTERNAL_STATE_INITIALIZED ){ m_eState = INTERNAL_STATE_TUNING_IN; }
+
+  // Enable header-only mode on the decoder (idempotent).
+  if( !m_cDecLib->isHeaderOnly() )
+  {
+    msg( VERBOSE, "decodeHeaderOnly: enabling header-only mode\n" );
+  }
+  m_cDecLib->setHeaderOnly( true );
+
+  if( !rcAccessUnit.payload )
+  {
+    return setAndRetErrorMsg( VVDEC_ERR_DEC_INPUT, "payload is null" );
+  }
+  if( rcAccessUnit.payloadSize <= 0 )
+  {
+    return setAndRetErrorMsg( VVDEC_ERR_DEC_INPUT, "payloadSize must be > 0" );
+  }
+  if( rcAccessUnit.payloadUsedSize > rcAccessUnit.payloadSize )
+  {
+    return setAndRetErrorMsg( VVDEC_ERR_DEC_INPUT, "payloadUsedSize must be <= payloadSize" );
+  }
+
+  int iRet = VVDEC_OK;
+
+  try
+  {
+    InputNALUnit nalu;
+
+    if( rcAccessUnit.payloadUsedSize )
+    {
+      bool                bStartCodeFound = false;
+      std::vector<size_t> iStartCodePosVec;
+      std::vector<size_t> iAUEndPosVec;
+      std::vector<size_t> iStartCodeSizeVec;
+
+      int pos = 0;
+      while( pos + 3 < rcAccessUnit.payloadUsedSize )
+      {
+        CHECK( pos >= rcAccessUnit.payloadUsedSize, "could not find a startcode" );
+
+        int iFound = xRetrieveNalStartCode( &rcAccessUnit.payload[pos], 3 );
+        if( iFound == 1 )
+        {
+          bStartCodeFound = true;
+          iStartCodePosVec.push_back( pos + 4 );
+          iStartCodeSizeVec.push_back( 4 );
+          if( pos > 0 )
+          {
+            iAUEndPosVec.push_back( pos );
+          }
+          pos += 3;
+        }
+        else
+        {
+          iFound = xRetrieveNalStartCode( &rcAccessUnit.payload[pos], 2 );
+          if( iFound == 1 )
+          {
+            bStartCodeFound = true;
+            iStartCodePosVec.push_back( pos + 3 );
+            iStartCodeSizeVec.push_back( 3 );
+            if( pos > 0 )
+            {
+              iAUEndPosVec.push_back( pos );
+            }
+            pos += 2;
+          }
+        }
+        pos++;
+      }
+
+      if( !bStartCodeFound )
+      {
+        return VVDEC_ERR_DEC_INPUT;
+      }
+
+      int iLastPos = rcAccessUnit.payloadUsedSize;
+      while( iLastPos > 0 && rcAccessUnit.payload[iLastPos - 1] == 0 )
+      {
+        iLastPos--;
+      }
+      iAUEndPosVec.push_back( iLastPos );
+
+      if( !iStartCodePosVec.empty() && iStartCodePosVec[0] != iStartCodeSizeVec[0] )
+      {
+        m_cErrorString = "vvdecAccessUnit does not start with valid start code.";
+        return VVDEC_ERR_DEC_INPUT;
+      }
+
+      InputBitstream& rBitstream = nalu.getBitstream();
+      for( size_t iAU = 0; iAU < iStartCodePosVec.size(); iAU++ )
+      {
+        rBitstream.resetToStart();
+        rBitstream.getFifo().clear();
+        rBitstream.clearEmulationPreventionByteLocation();
+
+        size_t numNaluBytes = iAUEndPosVec[iAU] - iStartCodePosVec[iAU];
+        if( numNaluBytes >= 2 )
+        {
+          const uint8_t*    naluData = &rcAccessUnit.payload[iStartCodePosVec[iAU]];
+          const NalUnitType nut      = (NalUnitType)( ( naluData[1] >> 3 ) & 0x1f );
+          if( 0 != xConvertPayloadToRBSP( naluData, numNaluBytes, &rBitstream, NALUnit::isVclNalUnitType( nut ) ) )
+          {
+            return VVDEC_ERR_UNSPECIFIED;
+          }
+
+          rBitstream.resetToStart();
+
+          if( 0 != xReadNalUnitHeader( nalu ) )
+          {
+            return VVDEC_ERR_UNSPECIFIED;
+          }
+
+          CHECKD( nut != nalu.m_nalUnitType, "Nal unit type parsed wrong." );
+
+          if( rcAccessUnit.ctsValid ){ nalu.m_cts = rcAccessUnit.cts; }
+          if( rcAccessUnit.dtsValid ){ nalu.m_dts = rcAccessUnit.dts; }
+          nalu.m_rap = rcAccessUnit.rap;
+          nalu.m_bits = ( numNaluBytes + iStartCodeSizeVec[iAU] ) * 8;
+#if VVDEC_USE_UNSTABLE_API
+          nalu.m_userData = rcAccessUnit.userData;
+#endif
+
+          // In header-only mode decode() always returns nullptr (no frame).
+          // Its side effect is to parse the slice header, build the reference
+          // picture lists and update the DPB.
+          m_cDecLib->decode( nalu );
+          msg( VERBOSE, "decodeHeaderOnly: fed NAL type %d, %zu bytes\n", (int) nalu.m_nalUnitType, numNaluBytes );
+        }
+      }
+    }
+  }
+  catch( RecoverableException& e )
+  {
+    m_cErrorString           = "(possibly recoverable) exception";
+    m_cAdditionalErrorString = std::string( "Exception occured: " ) + e.what();
+    if( m_eErrHandlingFlags & ERR_HANDLING_TRY_CONTINUE )
+    {
+      return VVDEC_ERR_DEC_INPUT;
+    }
+    m_eState = INTERNAL_STATE_RESTART_REQUIRED;
+    return VVDEC_ERR_RESTART_REQUIRED;
+  }
+
+  return iRet;
+}
+
 vvdecSEI* VVDecImpl::findFrameSei( vvdecSEIPayloadType payloadType, vvdecFrame *frame )
 {
   if( !m_bInitialized ){ return nullptr; }

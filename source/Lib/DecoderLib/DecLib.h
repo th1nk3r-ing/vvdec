@@ -80,6 +80,10 @@ class DecLib
   int  m_iMaxTemporalLayer  = -1;
   bool m_checkMissingOutput = false;
 
+  // Header-only mode: parse slice headers + maintain DPB but skip CABAC body
+  // and reconstruction. Set before the first decode() call.
+  bool m_headerOnly         = false;
+
   std::vector<NalUnitType> m_pictureUnitNals;
   std::list<InputNALUnit>  m_pictureSeiNalus;
 
@@ -93,6 +97,11 @@ public:
   const char* getDecoderCapabilities() const { return m_sDecoderCapabilities.c_str(); }
 
   void     setMaxTemporalLayer( int layer ) { m_iMaxTemporalLayer = layer; }
+
+  void     setHeaderOnly( bool v ) { m_headerOnly = v; m_decLibParser.setHeaderOnly( v ); }
+  bool     isHeaderOnly() const    { return m_headerOnly; }
+  // Peek the most recently completed parsed picture (header-only mode).
+  const Picture* getLastParsedPic() const { return m_decLibParser.getLastParsedPic(); }
 
   Picture* decode( InputNALUnit& nalu );
   Picture* flushPic();

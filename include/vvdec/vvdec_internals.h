@@ -215,6 +215,34 @@ VVDEC_DECL int vvdec_internals_get_gop_info_dec( vvdecDecoder *dec,
                                                  int refPocL0[16],
                                                  int refPocL1[16] );
 
+/* Get GOP info for the most recently completed header-only-parsed picture.
+ * Requires the decoder to be in header-only mode (vvdec_decode_headeronly).
+ * No vvdecFrame is needed — the metadata is read directly from the parser's
+ * internal picture state.
+ * \param[out] poc            picture order count of this frame
+ * \param[out] temporalLayer  temporal layer id
+ * \param[out] sliceType      0=B, 1=P, 2=I (of the first slice)
+ * \param[out] nalUnitType    NAL unit type of the first slice (for keyframe/IRAP detection)
+ * \param[out] isRAP          1 if IRAP picture (IDR/CRA/BLA/GDR)
+ * \param[out] allSlicesIntra 1 iff every slice in the picture is an I-slice
+ * \param[out] numRefPocL0    number of L0 reference pictures (filled into refPocL0)
+ * \param[out] numRefPocL1    number of L1 reference pictures (filled into refPocL1)
+ * \param[out] refPocL0       array of up to 16 L0 reference POCs
+ * \param[out] refPocL1       array of up to 16 L1 reference POCs
+ * \retval VVDEC_OK on success, VVDEC_ERR_INITIALIZE if no picture has been parsed yet
+ */
+VVDEC_DECL int vvdec_internals_get_gop_info_headeronly( vvdecDecoder *dec,
+                                                        int *poc,
+                                                        int *temporalLayer,
+                                                        int *sliceType,
+                                                        int *nalUnitType,
+                                                        int *isRAP,
+                                                        int *allSlicesIntra,
+                                                        int *numRefPocL0,
+                                                        int *numRefPocL1,
+                                                        int refPocL0[16],
+                                                        int refPocL1[16] );
+
 /* Get the decoding timestamp of a frame (for GOP plot alignment).
  * \retval int64_t DTS, or -1 if unavailable
  */
