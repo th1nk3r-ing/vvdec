@@ -107,6 +107,7 @@ void DecLibParser::destroy()
   SEI_internal::deleteSEIs( m_seiMessageList );
 
   m_threadPool    = nullptr;
+  m_lastParsedPic = nullptr;
 
   delete m_apcSlicePilot;
   m_apcSlicePilot = nullptr;
@@ -252,7 +253,7 @@ bool DecLibParser::parse( InputNALUnit& nalu )
       const VPS* vps = m_parameterSetManager.getVPS( sps->getVPSId() );
       m_seiReader.parseSEImessage( &( nalu.getBitstream() ), m_pcParsePic->seiMessageList, nalu.m_nalUnitType, nalu.m_nuhLayerId, nalu.m_temporalId, vps, sps, m_HRD, m_pDecodedSEIOutputStream );
 
-      if( m_parseFrameDelay == 0 && !m_pcParsePic->error )   // if m_parseFrameDelay > 0, it has to be done in finishPicture()
+      if( m_parseFrameDelay == 0 && !m_headerOnly && !m_pcParsePic->error )   // if m_parseFrameDelay > 0, it has to be done in finishPicture()
       {
         // if parallel parsing is disabled, wait for the picture to finish
         if( m_threadPool->numThreads() == 0 )
@@ -311,6 +312,13 @@ void DecLibParser::failIncompleteParsePic()
 
   // reconstruction can already be waiting for CTUs, that will never be parsed, so the picture needs to be failed explicitly
   m_pcParsePic->setParseError( std::make_exception_ptr( RecoverableException( "the slices of the picture don't cover all CTUs" ) ) );
+
+  // a failed picture must not stay visible as last parsed
+  if( m_lastParsedPic == m_pcParsePic )
+  {
+    m_lastParsedPic = nullptr;
+  }
+
   m_pcParsePic = nullptr;
 }
 
@@ -319,6 +327,14 @@ Picture* DecLibParser::getNextDecodablePicture()
   if( m_parseFrameList.empty() )
   {
     return nullptr;
+  }
+
+  // Header-only pictures skip the CABAC parser, so the barriers below never unblock.
+  if( m_headerOnly )
+  {
+    Picture* pic = m_parseFrameList.front();
+    m_parseFrameList.pop_front();
+    return pic;
   }
 
   if( m_threadPool->numThreads() == 0 || m_parseFrameDelay == 0 )
@@ -1069,6 +1085,7 @@ bool DecLibParser::xDecodeSliceMain( InputNALUnit& nalu )
     if( m_headerOnly )
     {
       m_lastParsedPic = m_pcParsePic;
+      m_lastParsedPicSequence++;
       msg( VERBOSE, "header-only: picture complete POC %d\n", m_pcParsePic->poc );
     }
     return true;

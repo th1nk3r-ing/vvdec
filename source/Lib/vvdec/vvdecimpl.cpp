@@ -78,6 +78,16 @@ constexpr T* allocInto( char** storage )
   return ret;
 }
 
+// trailing_zero_8bits between a NAL unit and the next start code belong to neither of them (Rec. ITU-T H.266 Annex B)
+static int xNalEndPos( const uint8_t* pPayload, int iEndPos )
+{
+  while( iEndPos > 0 && pPayload[iEndPos-1] == 0 )
+  {
+    iEndPos--;
+  }
+  return iEndPos;
+}
+
 VVDecImpl::VVDecImpl() = default;
 VVDecImpl::~VVDecImpl() = default;
 
@@ -190,6 +200,9 @@ int VVDecImpl::uninit()
   if( !m_bInitialized ){ return VVDEC_ERR_INITIALIZE; }
 
   reset();
+
+  // header-only mode is a one-way switch on the decoder, reset it before destroying
+  m_cDecLib->setHeaderOnly( false );
 
   // destroy internal classes
   m_cDecLib->destroy();
@@ -326,22 +339,9 @@ int VVDecImpl::decode( vvdecAccessUnit& rcAccessUnit, vvdecFrame** ppcFrame )
       std::vector<size_t> iAUEndPosVec;
       std::vector<size_t> iStartCodeSizeVec;
 
-      // trailing_zero_8bits between a NAL unit and the next start code belong to neither of them (Rec. ITU-T H.266 Annex B)
-      auto pushNalEndPos = [&]( int iEndPos )
-      {
-        while( iEndPos > 0 && rcAccessUnit.payload[iEndPos-1] == 0 )
-        {
-          iEndPos--;
-        }
-        iAUEndPosVec.push_back( iEndPos );
-      };
-
       int pos = 0;
       while( pos+3 < rcAccessUnit.payloadUsedSize )
       {
-        // no start code found
-        CHECK( pos >= rcAccessUnit.payloadUsedSize, "could not find a startcode" );
-
         int iFound = xRetrieveNalStartCode( &rcAccessUnit.payload[pos], 3 );
         if( iFound == 1 )
         {
@@ -352,7 +352,7 @@ int VVDecImpl::decode( vvdecAccessUnit& rcAccessUnit, vvdecFrame** ppcFrame )
 
           if( pos > 0 )
           {
-            pushNalEndPos( pos );
+            iAUEndPosVec.push_back( xNalEndPos( rcAccessUnit.payload, pos ) );
           }
 
           pos+=3;
@@ -368,7 +368,7 @@ int VVDecImpl::decode( vvdecAccessUnit& rcAccessUnit, vvdecFrame** ppcFrame )
             iStartCodeSizeVec.push_back( 3 );
             if( pos > 0 )
             {
-              pushNalEndPos( pos );
+              iAUEndPosVec.push_back( xNalEndPos( rcAccessUnit.payload, pos ) );
             }
 
             pos+=2;
@@ -382,7 +382,7 @@ int VVDecImpl::decode( vvdecAccessUnit& rcAccessUnit, vvdecFrame** ppcFrame )
         return VVDEC_ERR_DEC_INPUT;
       }
 
-      pushNalEndPos( rcAccessUnit.payloadUsedSize );
+      iAUEndPosVec.push_back( xNalEndPos( rcAccessUnit.payload, rcAccessUnit.payloadUsedSize ) );
 
       // check if first AU begins on begin of payload (otherwise wrong input), but we allow empty input
       if( !iStartCodePosVec.empty() && iStartCodePosVec[0] != iStartCodeSizeVec[0] )
@@ -568,6 +568,10 @@ int VVDecImpl::flush( vvdecFrame** ppframe )
       {
          *ppframe = &std::get<vvdecFrame>( *m_pcFrameNext );
          m_uiSeqNumOutput = ( *ppframe )->sequenceNumber;
+         if( Picture* pic = std::get<Picture*>( *m_pcFrameNext ) )
+         {
+           pic->lockedByApplication = Picture::LOCKED;
+         }
          ++m_pcFrameNext;
       }
     }
@@ -657,8 +661,6 @@ int VVDecImpl::decodeHeaderOnly( vvdecAccessUnit& rcAccessUnit, vvdecFrame** ppc
       int pos = 0;
       while( pos + 3 < rcAccessUnit.payloadUsedSize )
       {
-        CHECK( pos >= rcAccessUnit.payloadUsedSize, "could not find a startcode" );
-
         int iFound = xRetrieveNalStartCode( &rcAccessUnit.payload[pos], 3 );
         if( iFound == 1 )
         {
@@ -667,7 +669,7 @@ int VVDecImpl::decodeHeaderOnly( vvdecAccessUnit& rcAccessUnit, vvdecFrame** ppc
           iStartCodeSizeVec.push_back( 4 );
           if( pos > 0 )
           {
-            iAUEndPosVec.push_back( pos );
+            iAUEndPosVec.push_back( xNalEndPos( rcAccessUnit.payload, pos ) );
           }
           pos += 3;
         }
@@ -681,7 +683,7 @@ int VVDecImpl::decodeHeaderOnly( vvdecAccessUnit& rcAccessUnit, vvdecFrame** ppc
             iStartCodeSizeVec.push_back( 3 );
             if( pos > 0 )
             {
-              iAUEndPosVec.push_back( pos );
+              iAUEndPosVec.push_back( xNalEndPos( rcAccessUnit.payload, pos ) );
             }
             pos += 2;
           }
@@ -694,12 +696,7 @@ int VVDecImpl::decodeHeaderOnly( vvdecAccessUnit& rcAccessUnit, vvdecFrame** ppc
         return VVDEC_ERR_DEC_INPUT;
       }
 
-      int iLastPos = rcAccessUnit.payloadUsedSize;
-      while( iLastPos > 0 && rcAccessUnit.payload[iLastPos - 1] == 0 )
-      {
-        iLastPos--;
-      }
-      iAUEndPosVec.push_back( iLastPos );
+      iAUEndPosVec.push_back( xNalEndPos( rcAccessUnit.payload, rcAccessUnit.payloadUsedSize ) );
 
       if( !iStartCodePosVec.empty() && iStartCodePosVec[0] != iStartCodeSizeVec[0] )
       {
@@ -804,7 +801,7 @@ vvdecSEI* VVDecImpl::findFrameSei( vvdecSEIPayloadType payloadType, vvdecFrame *
 }
 
 
-const Picture* VVDecImpl::getPictureFromFrame( const vvdecFrame* frame ) const
+Picture* VVDecImpl::getPictureFromFrame( const vvdecFrame* frame )
 {
   if( !m_bInitialized ) { return nullptr; }
   if( nullptr == frame ) { return nullptr; }
@@ -819,19 +816,10 @@ const Picture* VVDecImpl::getPictureFromFrame( const vvdecFrame* frame ) const
   return nullptr;
 }
 
-Picture* VVDecImpl::getPictureFromFrame( const vvdecFrame* frame )
-{
-  if( !m_bInitialized ) { return nullptr; }
-  if( nullptr == frame ) { return nullptr; }
 
-  for( auto& entry : m_rcFrameList )
-  {
-    if( frame == &std::get<vvdecFrame>( entry ) )
-    {
-      return std::get<Picture*>( entry );
-    }
-  }
-  return nullptr;
+uint64_t VVDecImpl::getLastParsedPicSequence() const
+{
+  return m_cDecLib ? m_cDecLib->getLastParsedPicSequence() : 0;
 }
 
 
@@ -1202,6 +1190,13 @@ int VVDecImpl::xAddPicture( Picture* pcPic )
     }
   }
 
+#ifdef VVDEC_INTERNALS_ENABLED
+  // The internals API dereferences the Picture until vvdec_frame_unref().
+  const bool bKeepPicture = true;
+#else
+  const bool bKeepPicture = false;
+#endif
+
   // create a brand new picture object
   vvdecFrame cFrame;
   vvdec_frame_default( &cFrame );
@@ -1398,7 +1393,7 @@ int VVDecImpl::xAddPicture( Picture* pcPic )
     xAddGrain( &cFrame );
   }
 
-  m_rcFrameList.emplace_back( cFrame, bCreateStorage ? nullptr : pcPic );
+  m_rcFrameList.emplace_back( cFrame, ( bCreateStorage && !bKeepPicture ) ? nullptr : pcPic );
 
   if( m_pcFrameNext == m_rcFrameList.end() )
   {
@@ -1421,7 +1416,7 @@ int VVDecImpl::xAddPicture( Picture* pcPic )
 
   m_uiSeqNumber++;
 
-  if( bCreateStorage )
+  if( bCreateStorage && !bKeepPicture )
   {
     // release library picture storage, because picture has been copied into new storage class
     m_cDecLib->releasePicture( pcPic );

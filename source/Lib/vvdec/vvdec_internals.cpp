@@ -84,6 +84,43 @@ vvdec::VVDecImpl* implFromDecoder( vvdecDecoder* dec )
   return reinterpret_cast<vvdec::VVDecImpl*>( dec );
 }
 
+void writeRefPocList( const vvdec::Slice* slice, const vvdec::RefPicList list, int* numRefPoc, int refPoc[16] )
+{
+  const int numRef = (int) slice->getNumRefIdx( list );
+  if( numRefPoc )
+  {
+    *numRefPoc = numRef;
+  }
+  if( refPoc )
+  {
+    const int n = std::min( numRef, 16 );
+    for( int i = 0; i < 16; i++ )
+    {
+      refPoc[i] = ( i < n ) ? slice->getRefPOC( list, i ) : 0;
+    }
+  }
+}
+
+void writeGopScalars( const vvdec::Picture* pic, const vvdec::Slice* slice, int* poc, int* temporalLayer, int* sliceType, int* isRAP )
+{
+  if( poc )
+  {
+    *poc = pic->poc;
+  }
+  if( temporalLayer )
+  {
+    *temporalLayer = (int) slice->getTLayer();
+  }
+  if( sliceType )
+  {
+    *sliceType = (int) slice->getSliceType();
+  }
+  if( isRAP )
+  {
+    *isRAP = slice->isClvssPu() ? 1 : 0;
+  }
+}
+
 } // anonymous namespace
 
 #ifdef __cplusplus
@@ -112,16 +149,7 @@ int vvdec_internals_get_ctb_info_layout_dec( vvdecDecoder *dec,
   {
     return VVDEC_ERR_INITIALIZE;
   }
-  if( !pic->cs )
-  {
-    return VVDEC_ERR_INITIALIZE;
-  }
-  const vvdec::CodingStructure* cs = pic->cs.get();
-  const vvdec::PreCalcValues*   pcv = cs->pcv;
-  if( !pcv )
-  {
-    return VVDEC_ERR_INITIALIZE;
-  }
+  const vvdec::PreCalcValues* pcv = pic->cs->pcv;
   if( widthInCtbs )
   {
     *widthInCtbs = (int) pcv->widthInCtus;
@@ -147,17 +175,16 @@ int vvdec_internals_get_ctb_slice_idx_dec( vvdecDecoder *dec,
     return VVDEC_ERR_INITIALIZE;
   }
   const vvdec::Picture* pic = pictureFromFrame( impl, frame );
-  if( !pic || !pic->cs )
+  if( !pic )
   {
     return VVDEC_ERR_INITIALIZE;
+  }
+  if( !out )
+  {
+    return VVDEC_ERR_PARAMETER;
   }
   const vvdec::CodingStructure* cs = pic->cs.get();
-  const vvdec::PreCalcValues*   pcv = cs->pcv;
-  if( !pcv )
-  {
-    return VVDEC_ERR_INITIALIZE;
-  }
-  const int numCtus = (int) pcv->sizeInCtus;
+  const int numCtus = (int) cs->pcv->sizeInCtus;
   for( int ctuRsAddr = 0; ctuRsAddr < numCtus; ctuRsAddr++ )
   {
     const vvdec::CtuData& ctuData = cs->getCtuData( ctuRsAddr );
@@ -187,15 +214,11 @@ int vvdec_internals_get_cb_info_layout_dec( vvdecDecoder *dec,
     return VVDEC_ERR_INITIALIZE;
   }
   const vvdec::Picture* pic = pictureFromFrame( impl, frame );
-  if( !pic || !pic->cs )
+  if( !pic )
   {
     return VVDEC_ERR_INITIALIZE;
   }
   const vvdec::PreCalcValues* pcv = pic->cs->pcv;
-  if( !pcv )
-  {
-    return VVDEC_ERR_INITIALIZE;
-  }
   if( widthInMinCUs )
   {
     *widthInMinCUs = ( (int) pcv->lumaWidth + (int) pcv->minCUWidth - 1 ) >> pcv->minCUWidthLog2;
@@ -235,8 +258,8 @@ static uint16_t packCuInfo( const vvdec::CodingUnit* cu, bool isOrigin )
   v |= (uint16_t)( ( cu->predMode() & 0x3 ) << 7 );
   // bits 9-11: qtDepth
   v |= (uint16_t)( ( cu->qtDepth & 0x7 ) << 9 );
-  // bits 12-14: mtDepth (cu->depth)
-  v |= (uint16_t)( ( cu->depth & 0x7 ) << 12 );
+  // bits 12-14: MT depth (without QT depth)
+  v |= (uint16_t)( ( ( cu->depth - cu->qtDepth ) & 0x7 ) << 12 );
   // bit 15: skip flag (most useful single flag; merge/affine omitted for space)
   if( cu->skip() )
   {
@@ -255,16 +278,16 @@ int vvdec_internals_get_cb_info_dec( vvdecDecoder *dec,
     return VVDEC_ERR_INITIALIZE;
   }
   const vvdec::Picture* pic = pictureFromFrame( impl, frame );
-  if( !pic || !pic->cs )
+  if( !pic )
   {
     return VVDEC_ERR_INITIALIZE;
+  }
+  if( !out )
+  {
+    return VVDEC_ERR_PARAMETER;
   }
   const vvdec::CodingStructure* cs = pic->cs.get();
   const vvdec::PreCalcValues*   pcv = cs->pcv;
-  if( !pcv )
-  {
-    return VVDEC_ERR_INITIALIZE;
-  }
   const int minCuLog2 = (int) pcv->minCUWidthLog2;
   const int widthInMinCUs  = ( (int) pcv->lumaWidth  + (int) pcv->minCUWidth  - 1 ) >> minCuLog2;
   const int heightInMinCUs = ( (int) pcv->lumaHeight + (int) pcv->minCUHeight - 1 ) >> minCuLog2;
@@ -320,16 +343,16 @@ int vvdec_internals_get_pb_info_dec( vvdecDecoder *dec,
     return VVDEC_ERR_INITIALIZE;
   }
   const vvdec::Picture* pic = pictureFromFrame( impl, frame );
-  if( !pic || !pic->cs )
+  if( !pic )
   {
     return VVDEC_ERR_INITIALIZE;
+  }
+  if( !out_mv0_x || !out_mv0_y || !out_mv1_x || !out_mv1_y || !out_ref_idx0 || !out_ref_idx1 )
+  {
+    return VVDEC_ERR_PARAMETER;
   }
   const vvdec::CodingStructure* cs = pic->cs.get();
   const vvdec::PreCalcValues*   pcv = cs->pcv;
-  if( !pcv )
-  {
-    return VVDEC_ERR_INITIALIZE;
-  }
   const int minCuLog2 = (int) pcv->minCUWidthLog2;
   const int widthInMinCUs  = ( (int) pcv->lumaWidth  + (int) pcv->minCUWidth  - 1 ) >> minCuLog2;
   const int heightInMinCUs = ( (int) pcv->lumaHeight + (int) pcv->minCUHeight - 1 ) >> minCuLog2;
@@ -348,13 +371,14 @@ int vvdec_internals_get_pb_info_dec( vvdecDecoder *dec,
       const int idx = y * widthInMinCUs + x;
       if( cu )
       {
-        // mv[list][0] is the first (non-affine) control point MV.
-        out_mv0_x[idx] = (int16_t) cu->mv[vvdec::REF_PIC_LIST_0][0].getHor();
-        out_mv0_y[idx] = (int16_t) cu->mv[vvdec::REF_PIC_LIST_0][0].getVer();
-        out_mv1_x[idx] = (int16_t) cu->mv[vvdec::REF_PIC_LIST_1][0].getHor();
-        out_mv1_y[idx] = (int16_t) cu->mv[vvdec::REF_PIC_LIST_1][0].getVer();
-        out_ref_idx0[idx] = (int16_t) cu->refIdx[vvdec::REF_PIC_LIST_0];
-        out_ref_idx1[idx] = (int16_t) cu->refIdx[vvdec::REF_PIC_LIST_1];
+        // Per-4x4 field, unlike cu->mv[][] it keeps affine/ATMVP/GEO/DMVR; intra and IBC are MI_NOT_VALID.
+        const vvdec::MotionInfo& mi = cs->getMotionInfo( pos );
+        out_mv0_x[idx] = (int16_t) mi.mv[vvdec::REF_PIC_LIST_0].getHor();
+        out_mv0_y[idx] = (int16_t) mi.mv[vvdec::REF_PIC_LIST_0].getVer();
+        out_mv1_x[idx] = (int16_t) mi.mv[vvdec::REF_PIC_LIST_1].getHor();
+        out_mv1_y[idx] = (int16_t) mi.mv[vvdec::REF_PIC_LIST_1].getVer();
+        out_ref_idx0[idx] = (int16_t) mi.miRefIdx[vvdec::REF_PIC_LIST_0];
+        out_ref_idx1[idx] = (int16_t) mi.miRefIdx[vvdec::REF_PIC_LIST_1];
       }
       else
       {
@@ -394,16 +418,16 @@ int vvdec_internals_get_intra_dir_info_dec( vvdecDecoder *dec,
     return VVDEC_ERR_INITIALIZE;
   }
   const vvdec::Picture* pic = pictureFromFrame( impl, frame );
-  if( !pic || !pic->cs )
+  if( !pic )
   {
     return VVDEC_ERR_INITIALIZE;
+  }
+  if( !out_intra_dir_y || !out_intra_dir_c )
+  {
+    return VVDEC_ERR_PARAMETER;
   }
   const vvdec::CodingStructure* cs = pic->cs.get();
   const vvdec::PreCalcValues*   pcv = cs->pcv;
-  if( !pcv )
-  {
-    return VVDEC_ERR_INITIALIZE;
-  }
   const int minCuLog2 = (int) pcv->minCUWidthLog2;
   const int widthInMinCUs  = ( (int) pcv->lumaWidth  + (int) pcv->minCUWidth  - 1 ) >> minCuLog2;
   const int heightInMinCUs = ( (int) pcv->lumaHeight + (int) pcv->minCUHeight - 1 ) >> minCuLog2;
@@ -422,8 +446,16 @@ int vvdec_internals_get_intra_dir_info_dec( vvdecDecoder *dec,
       const int idx = y * widthInMinCUs + x;
       if( cu )
       {
+        // getCU() expects chroma-resolution positions; in a dual tree the chroma CU owns the mode.
+        const vvdec::Position posC = vvdec::recalcPosition( cs->area.chromaFormat, vvdec::CHANNEL_TYPE_LUMA,
+                                                            vvdec::CHANNEL_TYPE_CHROMA, pos );
+        const vvdec::CodingUnit* cuC = cs->getCU( posC, vvdec::CHANNEL_TYPE_CHROMA );
+        if( !cuC )
+        {
+          cuC = cu;
+        }
         out_intra_dir_y[idx] = (uint8_t) cu->intraDir[vvdec::CHANNEL_TYPE_LUMA];
-        out_intra_dir_c[idx] = (uint8_t) cu->intraDir[vvdec::CHANNEL_TYPE_CHROMA];
+        out_intra_dir_c[idx] = (uint8_t) cuC->intraDir[vvdec::CHANNEL_TYPE_CHROMA];
       }
       else
       {
@@ -458,23 +490,19 @@ int vvdec_internals_get_tu_info_dec( vvdecDecoder *dec,
     return VVDEC_ERR_INITIALIZE;
   }
   const vvdec::Picture* pic = pictureFromFrame( impl, frame );
-  if( !pic || !pic->cs )
+  if( !pic )
   {
     return VVDEC_ERR_INITIALIZE;
+  }
+  if( !out )
+  {
+    return VVDEC_ERR_PARAMETER;
   }
   const vvdec::CodingStructure* cs = pic->cs.get();
   const vvdec::PreCalcValues*   pcv = cs->pcv;
-  if( !pcv )
-  {
-    return VVDEC_ERR_INITIALIZE;
-  }
   const int minCuLog2 = (int) pcv->minCUWidthLog2;
   const int widthInMinCUs  = ( (int) pcv->lumaWidth  + (int) pcv->minCUWidth  - 1 ) >> minCuLog2;
   const int heightInMinCUs = ( (int) pcv->lumaHeight + (int) pcv->minCUHeight - 1 ) >> minCuLog2;
-
-  static int s_diagCount = 0;
-  int cuCount = 0, tuCount = 0, splitCuCount = 0;
-  int depthHist[8] = {};
 
   for( int y = 0; y < heightInMinCUs; y++ )
   {
@@ -492,41 +520,23 @@ int vvdec_internals_get_tu_info_dec( vvdecDecoder *dec,
       uint8_t tuDepth = 0;
       if( cu )
       {
-        // Only count each CU once (at its origin).
-        if( (int) cu->lwidth() > 0 && ( px % (int) cu->lwidth() == 0 ) && ( py % (int) cu->lheight() == 0 ) )
-        {
-          cuCount++;
-          int nTU = 0;
-          for( const vvdec::TransformUnit* tu = &cu->firstTU; tu != nullptr; tu = tu->next )
-            nTU++;
-          if( nTU > 1 )
-            splitCuCount++;
-        }
-
-        const int cuSizeLog2 = (int) vvdec::getLog2( (int) cu->lwidth() );
+        // TransformUnit stores no tree depth: derive it from both dimensions. TT side TUs read one level too deep.
+        const int cuWLog2 = (int) vvdec::getLog2( (int) cu->lwidth() );
+        const int cuHLog2 = (int) vvdec::getLog2( (int) cu->lheight() );
         for( const vvdec::TransformUnit* tu = &cu->firstTU; tu != nullptr; tu = tu->next )
         {
-          tuCount++;
           if( tu->Y().contains( pos ) )
           {
-            const int tuSizeLog2 = (int) vvdec::getLog2( (int) tu->lwidth() );
-            const int depth = cuSizeLog2 - tuSizeLog2;
+            const int wDepth = cuWLog2 - (int) vvdec::getLog2( (int) tu->lwidth() );
+            const int hDepth = cuHLog2 - (int) vvdec::getLog2( (int) tu->lheight() );
+            const int depth  = std::max( wDepth, hDepth );
             tuDepth = (uint8_t)( depth > 0 ? depth : 0 );
             break;
           }
         }
       }
       out[idx] = tuDepth;
-      depthHist[tuDepth < 8 ? tuDepth : 7]++;
     }
-  }
-
-  if( s_diagCount < 3 )
-  {
-    fprintf( stderr, "[vvdec TU diag %d] CUs=%d splitCUs=%d totalTUs=%d depthHist: 0=%d 1=%d 2=%d 3=%d\n",
-             s_diagCount, cuCount, splitCuCount, tuCount,
-             depthHist[0], depthHist[1], depthHist[2], depthHist[3] );
-    s_diagCount++;
   }
 
   return VVDEC_OK;
@@ -558,51 +568,9 @@ int vvdec_internals_get_gop_info_dec( vvdecDecoder *dec,
     return VVDEC_ERR_INITIALIZE;
   }
   const vvdec::Slice* slice = pic->slices.front();
-  if( !slice )
-  {
-    return VVDEC_ERR_INITIALIZE;
-  }
-  if( poc )
-  {
-    *poc = pic->poc;
-  }
-  if( temporalLayer )
-  {
-    *temporalLayer = (int) slice->getTLayer();
-  }
-  if( sliceType )
-  {
-    // VVC: B_SLICE=0, P_SLICE=1, I_SLICE=2
-    *sliceType = (int) slice->getSliceType();
-  }
-  if( isRAP )
-  {
-    *isRAP = slice->isIRAP() ? 1 : 0;
-  }
-  if( numRefPocL0 )
-  {
-    *numRefPocL0 = (int) slice->getNumRefIdx( vvdec::REF_PIC_LIST_0 );
-  }
-  if( numRefPocL1 )
-  {
-    *numRefPocL1 = (int) slice->getNumRefIdx( vvdec::REF_PIC_LIST_1 );
-  }
-  if( refPocL0 )
-  {
-    const int n = std::min( (int) slice->getNumRefIdx( vvdec::REF_PIC_LIST_0 ), 16 );
-    for( int i = 0; i < 16; i++ )
-    {
-      refPocL0[i] = ( i < n ) ? slice->getRefPOC( vvdec::REF_PIC_LIST_0, i ) : 0;
-    }
-  }
-  if( refPocL1 )
-  {
-    const int n = std::min( (int) slice->getNumRefIdx( vvdec::REF_PIC_LIST_1 ), 16 );
-    for( int i = 0; i < 16; i++ )
-    {
-      refPocL1[i] = ( i < n ) ? slice->getRefPOC( vvdec::REF_PIC_LIST_1, i ) : 0;
-    }
-  }
+  writeGopScalars( pic, slice, poc, temporalLayer, sliceType, isRAP );
+  writeRefPocList( slice, vvdec::REF_PIC_LIST_0, numRefPocL0, refPocL0 );
+  writeRefPocList( slice, vvdec::REF_PIC_LIST_1, numRefPocL1, refPocL1 );
   return VVDEC_OK;
 }
 
@@ -620,7 +588,8 @@ int vvdec_internals_get_gop_info_headeronly( vvdecDecoder *dec,
                                              int *numRefPocL0,
                                              int *numRefPocL1,
                                              int refPocL0[16],
-                                             int refPocL1[16] )
+                                             int refPocL1[16],
+                                             int64_t *picSequence )
 {
   auto* impl = implFromDecoder( dec );
   if( !impl )
@@ -634,31 +603,10 @@ int vvdec_internals_get_gop_info_headeronly( vvdecDecoder *dec,
     return VVDEC_ERR_INITIALIZE;
   }
   const vvdec::Slice* slice = pic->slices.front();
-  if( !slice )
-  {
-    vvdec::msg( vvdec::WARNING, "vvdec_internals_get_gop_info_headeronly: first slice is null\n" );
-    return VVDEC_ERR_INITIALIZE;
-  }
-  if( poc )
-  {
-    *poc = pic->poc;
-  }
-  if( temporalLayer )
-  {
-    *temporalLayer = (int) slice->getTLayer();
-  }
-  if( sliceType )
-  {
-    // VVC: B_SLICE=0, P_SLICE=1, I_SLICE=2
-    *sliceType = (int) slice->getSliceType();
-  }
+  writeGopScalars( pic, slice, poc, temporalLayer, sliceType, isRAP );
   if( nalUnitType )
   {
     *nalUnitType = (int) slice->getNalUnitType();
-  }
-  if( isRAP )
-  {
-    *isRAP = slice->isIRAP() ? 1 : 0;
   }
   if( allSlicesIntra )
   {
@@ -673,35 +621,17 @@ int vvdec_internals_get_gop_info_headeronly( vvdecDecoder *dec,
     }
     *allSlicesIntra = allIntra ? 1 : 0;
   }
-  if( numRefPocL0 )
+  writeRefPocList( slice, vvdec::REF_PIC_LIST_0, numRefPocL0, refPocL0 );
+  writeRefPocList( slice, vvdec::REF_PIC_LIST_1, numRefPocL1, refPocL1 );
+  if( picSequence )
   {
-    *numRefPocL0 = (int) slice->getNumRefIdx( vvdec::REF_PIC_LIST_0 );
-  }
-  if( numRefPocL1 )
-  {
-    *numRefPocL1 = (int) slice->getNumRefIdx( vvdec::REF_PIC_LIST_1 );
-  }
-  if( refPocL0 )
-  {
-    const int n = std::min( (int) slice->getNumRefIdx( vvdec::REF_PIC_LIST_0 ), 16 );
-    for( int i = 0; i < 16; i++ )
-    {
-      refPocL0[i] = ( i < n ) ? slice->getRefPOC( vvdec::REF_PIC_LIST_0, i ) : 0;
-    }
-  }
-  if( refPocL1 )
-  {
-    const int n = std::min( (int) slice->getNumRefIdx( vvdec::REF_PIC_LIST_1 ), 16 );
-    for( int i = 0; i < 16; i++ )
-    {
-      refPocL1[i] = ( i < n ) ? slice->getRefPOC( vvdec::REF_PIC_LIST_1, i ) : 0;
-    }
+    *picSequence = (int64_t) impl->getLastParsedPicSequence();
   }
   return VVDEC_OK;
 }
 
 /* ===========================================================================
- * Image DTS
+ * Image timestamp (named "dts" for API compatibility, returns CTS)
  * =========================================================================== */
 
 int64_t vvdec_internals_get_image_dts_dec( const vvdecFrame *frame )
@@ -710,9 +640,7 @@ int64_t vvdec_internals_get_image_dts_dec( const vvdecFrame *frame )
   {
     return -1;
   }
-  // The vvdecFrame stores the composition timestamp (cts) and a ctsValid flag.
-  // We return cts as the DTS surrogate; consumers that set CTS will get a
-  // monotonic frame ordering metric.
+  // vvdecFrame carries no DTS, only cts.
   return frame->ctsValid ? (int64_t) frame->cts : -1;
 }
 

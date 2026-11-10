@@ -82,10 +82,9 @@ class DecLib
 
   // Header-only mode: parse slice headers + maintain DPB but skip CABAC body
   // and reconstruction. Set before the first decode() call.
-  bool m_headerOnly         = false;
+  bool     m_headerOnly          = false;
+  Picture* m_headerOnlyKeptPic   = nullptr;   // last parsed picture, kept readable by the internals API
 
-  std::vector<NalUnitType> m_pictureUnitNals;
-  std::list<InputNALUnit>  m_pictureSeiNalus;
 public:
   DecLib();
   ~DecLib() = default;
@@ -101,6 +100,9 @@ public:
   bool     isHeaderOnly() const    { return m_headerOnly; }
   // Peek the most recently completed parsed picture (header-only mode).
   const Picture* getLastParsedPic() const { return m_decLibParser.getLastParsedPic(); }
+  // Only changes when a new picture completes.
+  uint64_t getLastParsedPicSequence() const { return m_decLibParser.getLastParsedPicSequence(); }
+
 
   Picture* decode( InputNALUnit& nalu );
   Picture* flushPic();

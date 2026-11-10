@@ -25,4 +25,5 @@ core
 /Testing/
 /out/
 /CMakeSettings.json
-build*
+/compile_commands.json
+/build-*/

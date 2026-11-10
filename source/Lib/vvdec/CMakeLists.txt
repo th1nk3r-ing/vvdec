@@ -205,7 +205,7 @@ add_library( ${LIB_NAME} ${SRC_FILES} $<$<TARGET_EXISTS:${LIB_NAME}_x86_simd>:$<
 target_compile_definitions( ${LIB_NAME} PUBLIC $<$<STREQUAL:$<TARGET_PROPERTY:${LIB_NAME},TYPE>,SHARED_LIBRARY>:${LIB_NAME_UC}_DYN_LINK> )
 
 if( VVDEC_ENABLE_INTERNALS )
-  target_compile_definitions( ${LIB_NAME} PUBLIC VVDEC_INTERNALS_ENABLED=1 )
+  target_compile_definitions( ${LIB_NAME} PRIVATE VVDEC_INTERNALS_ENABLED=1 )
 endif()
 
 target_include_directories( ${LIB_NAME} SYSTEM INTERFACE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../../../include> $<BUILD_INTERFACE:${CMAKE_BINARY_DIR}> )

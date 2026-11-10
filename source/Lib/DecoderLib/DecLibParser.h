@@ -131,9 +131,11 @@ private:
   // reconstruction. Used by the GOP-structure scanning API which only needs
   // POC / NAL type / reference POC metadata.
   bool                      m_headerOnly = false;
-  // Most recently completed parsed picture (set when the last slice of a
-  // picture is parsed). Valid for header-only GOP extraction. Not owned.
+  // Most recently completed parsed picture. Valid until the next picture
+  // completes or destroy(). Not owned.
   Picture*                  m_lastParsedPic = nullptr;
+  // Incremented together with m_lastParsedPic.
+  uint64_t                  m_lastParsedPicSequence = 0;
 
   CUChunkCache              m_cuChunkCache;
   TUChunkCache              m_tuChunkCache;
@@ -159,9 +161,9 @@ public:
   bool     isHeaderOnly         () const                { return m_headerOnly; }
   // Peek the most recently completed parsed picture (header-only mode).
   // Returns nullptr until the first picture's last slice has been parsed.
-  // The pointer is valid until the next call to parse(); the caller must not
-  // retain it across decode calls.
+  Picture*       getLastParsedPic()                     { return m_lastParsedPic; }
   const Picture* getLastParsedPic() const               { return m_lastParsedPic; }
+  uint64_t       getLastParsedPicSequence() const       { return m_lastParsedPicSequence; }
 
   void checkNoOutputPriorPics   ();
   void setNoOutputPriorPicsFlag (bool val)              { m_isNoOutputPriorPics = val; }

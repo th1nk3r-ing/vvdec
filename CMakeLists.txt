@@ -71,7 +71,7 @@ set( VVDEC_WRITE_INPUT_BITSTREAM FALSE                 CACHE BOOL "Write input b
 
 set( VVDEC_ENABLE_UNSTABLE_API OFF                     CACHE BOOL "Enable unstable API (include 3.0.0 API and ABI incompatible interface extensions)" )
 
-set( VVDEC_ENABLE_INTERNALS      ON                      CACHE BOOL "Enable internals API (vvdec_internals_*) for coding-structure analysis (CTU/CU/PU/TU/IntraDir/MV statistics)" )
+set( VVDEC_ENABLE_INTERNALS      OFF                     CACHE BOOL "Enable internals API (vvdec_internals_*) for coding-structure analysis (CTU/CU/PU/TU/IntraDir/MV statistics)" )
 
 set( VVDEC_USE_UNSTABLE_API 0 )
 if( VVDEC_ENABLE_UNSTABLE_API )
@@ -352,16 +352,23 @@ endif()
 # set address sanitizer compiler arguments
 if( VVDEC_USE_ADDRESS_SANITIZER )
   if( CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR
-    CMAKE_CXX_COMPILER_ID STREQUAL "Clang" )
-    message( STATUS "enabled GNU/Clang address sanitizer" )
+    CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR
+    CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang" )
+    message( STATUS "enabled GNU/Clang/AppleClang address sanitizer" )
     # add compile options
     add_compile_options( "-fsanitize=address" )
     add_compile_options( "-fsanitize=undefined" )
-    add_compile_options( "-fsanitize=leak" )
+    if( NOT CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang" )
+      # AppleClang rejects -fsanitize=leak; ASan's built-in leak detection is used instead.
+      add_compile_options( "-fsanitize=leak" )
+    endif()
     add_compile_options( "-fno-omit-frame-pointer" )
+    add_compile_options( "-g" )
     add_link_options( "-fsanitize=address" )
     add_link_options( "-fsanitize=undefined" )
-    add_link_options( "-fsanitize=leak" )
+    if( NOT CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang" )
+      add_link_options( "-fsanitize=leak" )
+    endif()
     add_link_options( "-fno-omit-frame-pointer" )
   elseif(MSVC)  
     message( STATUS "enabled MSVC address sanitizer" )

@@ -1,508 +1,551 @@
-# VVdeC Internals API — 静态分析支持
+# VVdeC Internals API 使用说明
 
-## 状态
+VVdeC 默认只对外提供解码后的 YUV 帧（`vvdecFrame`）。`vvdec_internals_*` 是在此之外的一组可选 C 接口，把解码器内部的编码结构（CTU slice 划分、CU 划分树、预测模式、运动信息、帧内方向、变换深度、GOP 元数据）导出为扁平缓冲区，供 YUView 这类分析工具直接消费，无需解析 trace 文本。
 
-- **提案阶段**：设计文档，尚未实现
-- **作者**：YUView 团队（首个在 VVdeC 中实现 internals API 的）
-- **参考实现**：`libde265-internals`、`libVTMDec`（均已被 YUView 消费）
-- **目标**：通过 C API 暴露 VVC 编码结构统计信息（CTU/CU/PU/TU/IntraDir/TransformDepth），使外部工具（YUView）无需解析 trace 文本即可渲染逐块分析叠加层
+接口全部声明在 `include/vvdec/vvdec_internals.h`，实现位于 `source/Lib/vvdec/vvdec_internals.cpp`。
 
-## 背景
+- 所有函数返回 `int`，只有 `vvdec_internals_get_image_dts_dec` 返回 `int64_t`。
+- 标量出参可以为 `NULL`（表示不关心该值）；CTU/min-CU 填表类函数的缓冲区出参必须非 `NULL`，否则返回 `VVDEC_ERR_PARAMETER`。
+- 查询只读，不修改解码器状态，也不需要加锁——但必须在帧被 `vvdec_frame_unref` 之前调用。
 
-### 为什么 VVdeC 需要 internals API
+## 1. 启用与支持性检测
 
-VVdeC 的公共 API（`include/vvdec/vvdec.h`）只暴露解码后的 YUV 帧（`vvdecFrame`）。所有编码结构信息（CU 划分树、预测模式、运动矢量、变换深度）都存在于内部 C++ 类（`CodingUnit`、`TransformUnit`、`CtuData`，位于 `source/Lib/CommonLib/`）中，从不外露。
+### 1.1 构建开关
 
-YUView 为 HEVC 通过 `libde265-internals`、为 VVC 通过 `libVTMDec` 渲染逐块统计叠加层（slice index、part size、pred mode、intra direction、inter direction、motion vector、transform depth）。要对 VVdeC 解码的流提供相同能力，VVdeC 必须暴露 internals API。
+```bash
+cmake -S . -B build -DVVDEC_ENABLE_INTERNALS=ON
+```
 
-### 为什么不复用现有 dtrace 机制
+| 项目 | 行为 |
+|---|---|
+| CMake 缓存变量 | `VVDEC_ENABLE_INTERNALS`，默认 `OFF` |
+| `OFF` | `vvdec_internals.cpp` 与 `vvdec_internals.h` 被 `FILTER ... EXCLUDE` 从源文件列表中剔除，不参与编译，库中不存在任何 `vvdec_internals_*` 符号 |
+| `ON` | 编译 `vvdec_internals.cpp` 并导出 13 个 `VVDEC_DECL` 符号 |
+| 编译定义 | `VVDEC_INTERNALS_ENABLED=1`，`PRIVATE`，只影响库自身编译，不进入下游编译命令行 |
 
-VVdeC 自带 `CDTrace` 系统（`source/Lib/CommonLib/dtrace.h` / `dtrace.cpp`），用于文本调试 trace。乍看是零修改的分析路径，但不适合作为 internals 传输主通道：
+注意：`vvdec_internals.h` 会随 `install(DIRECTORY include/vvdec ...)` 一起被安装，**无论开关是否打开**。因此"头文件存在"并不代表库里有实现；必须按 1.2 检测符号。
 
-| 维度 | dtrace（文本） | internals C API（本提案） |
-|---|---|---|
-| 传输 | `vfprintf` + `fflush` 写文件（`dtrace.cpp:314`），每次调用都同步刷盘 | 通过函数指针做内存结构体读回 |
-| 单次调用开销 | `va_list` 格式化 + 磁盘 I/O + flush | 一次指针解引用 + memcpy |
-| 消费端工作 | 把自由格式文本解析回结构化数据（正则/状态机） | 直接访问结构体字段 |
-| ABI 稳定性 | 无 — trace 字符串是临时约定 | 版本化结构体 + 枚举，只增不改 |
-| 线程 | 并发解码下 `fflush` 是竞争点 | 解码后只读，无需锁 |
-| 粒度 | 整帧 trace dump，过滤仅到 channel 级 | 按需逐 CTU / 逐 CU / 逐 PU / 逐 TU |
-| 可复现性 | 依赖 trace 字符串格式（跨版本漂移） | 由 `vvdec_internals_version()` 约束 |
+### 1.2 运行时检测
 
-**结论**：dtrace 是调试工具，不是稳定的分析传输通道。internals C API 才是正确做法；dtrace 可作为辅助调试保留，但不是主路径。
-
-### YUView 中的现有先例
-
-YUView 已消费两个可比的 internals API：
-
-- **`libde265-internals`**（`YUViewLib/src/decoder/externalHeader/libde265/de265_internals.h`）：平铺 C 函数 `de265_internals_get_CTB_Info_Layout`、`get_CB_info`、`get_PB_info`、`get_IntraDir_info`、`get_TUInfo_info`、`get_gop_info`。通过 `QLibrary::resolve` 加载；`internalsSupported` 由能否 resolve 出 `de265_internals_*` 符号决定，而非文件名。
-- **`libVTMDec`**（`YUViewLib/src/decoder/externalHeader/libVTMDecoder.h`）：VTM 参考解码器的 internals 表面，供 YUView 的 `decoderVTM` 使用。
-
-VVdeC internals API 应镜像 `libde265-internals` 的形状（平铺 C、layout+data 两次调用模式、可选符号 resolve），这样 YUView 现有的 `decoderLibde265::cacheStatistics` 实现可几乎原样移植到 `decoderVVDec`。
-
-## VVdeC 侧改动
-
-### 1. 新增公共头 `include/vvdec/vvdec_internals.h`
-
-自包含的 C 头（不含 C++ 类型），声明 internals 访问器。镜像 `de265_internals.h` 布局。
+当前没有版本函数。唯一的支持性判据是能否解析出符号：
 
 ```c
-#ifndef VVDEC_INTERNALS_H
-#define VVDEC_INTERNALS_H
-
-#include "vvdec.h"
-#include <stdint.h>
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-/* 结构体布局变更时递增。消费端必须检查 >= 预期版本。 */
-VVDEC_DECL int vvdec_internals_version(void);
-
-/* 不透明的 internals 快照句柄。生命周期与 vvdecFrame 绑定。 */
-typedef struct vvdec_internals_snapshot vvdec_internals_snapshot;
-
-/* --- CTU 网格布局（对应 de265_internals_get_CTB_Info_Layout） --- */
-VVDEC_DECL void vvdec_internals_get_ctu_layout(
-    const vvdecFrame *frame,
-    int *widthInCtu,
-    int *heightInCtu,
-    int *log2CtuSize);
-
-/* 逐 CTU 的 slice index。缓冲区大小 = widthInCtu * heightInCtu。 */
-VVDEC_DECL void vvdec_internals_get_ctu_slice_idx(
-    const vvdecFrame *frame,
-    uint16_t *sliceIdx);
-
-/* --- CU（coding unit）网格 --- */
-VVDEC_DECL void vvdec_internals_get_cu_layout(
-    const vvdecFrame *frame,
-    int *widthInCu,
-    int *heightInCu,
-    int *log2MinCuSize);
-
-/* 打包的 CU 信息。每个 uint16_t 在 min-CU 网格上编码 predMode/partSize/depth。
- * 布局镜像 de265_internals_get_CB_info：调用方分配
- * widthInCu * heightInCu 个 uint16_t。 */
-VVDEC_DECL void vvdec_internals_get_cu_info(
-    const vvdecFrame *frame,
-    uint16_t *cuInfo);
-
-/* --- PU（prediction unit） --- */
-VVDEC_DECL void vvdec_internals_get_pb_layout(
-    const vvdecFrame *frame,
-    int *widthInPb,
-    int *heightInPb,
-    int *log2MinPbSize);
-
-/* 逐 PB：运动矢量（每个参考列表 x,y）、参考索引（每个列表）、inter dir。 */
-VVDEC_DECL void vvdec_internals_get_pb_info(
-    const vvdecFrame *frame,
-    int16_t *mvL0X, int16_t *mvL0Y,
-    int16_t *mvL1X, int16_t *mvL1Y,
-    int16_t *refIdxL0, int16_t *refIdxL1,
-    int16_t *interDir);
-
-/* --- Intra direction --- */
-VVDEC_DECL void vvdec_internals_get_intra_dir_layout(
-    const vvdecFrame *frame,
-    int *widthInBlock,
-    int *heightInBlock,
-    int *log2BlockSize);
-
-VVDEC_DECL void vvdec_internals_get_intra_dir_info(
-    const vvdecFrame *frame,
-    uint8_t *intraDirLuma,
-    uint8_t *intraDirChroma);
-
-/* --- TU（transform unit） --- */
-VVDEC_DECL void vvdec_internals_get_tu_info_layout(
-    const vvdecFrame *frame,
-    int *widthInTu,
-    int *heightInTu,
-    int *log2MinTuSize);
-
-VVDEC_DECL void vvdec_internals_get_tu_info(
-    const vvdecFrame *frame,
-    uint8_t *tuInfo);
-
-/* --- GOP / 参考图像列表（用于 GOP 图） --- */
-VVDEC_DECL void vvdec_internals_get_gop_info(
-    const vvdecFrame *frame,
-    int *poc,
-    int *isRefPic,
-    int *sliceType,
-    int *temporalLayer,
-    int *nalType,
-    int *qp,
-    int refPocL0[16],
-    int refPocL1[16]);
-
-VVDEC_DECL int64_t vvdec_internals_get_image_dts(const vvdecFrame *frame);
-
-#ifdef __cplusplus
+/* QLibrary::resolve / dlsym / GetProcAddress 均可 */
+if( resolve( "vvdec_internals_get_ctb_info_layout_dec" ) )
+{
+  /* internals API 可用 */
 }
-#endif
-
-#endif /* VVDEC_INTERNALS_H */
 ```
 
-### 2. 实现 `source/Lib/vvdec/vvdec_internals.cpp`
+`vvdec_internals_get_ctb_info_layout_dec` 是布局查询入口，所有消费方第一步都要调用它，用它作为探测符号可以一次性确认整组接口可用。符号存在即认为整套 API 可用（同一构建产物中 13 个符号总是同时存在）。
 
-新增翻译单元，链接进 `vvdec` target。直接读取 `CommonLib` 和 `DecoderLib` 中已有的内部 `Picture` / `CodingStructure` / `CtuData` / `CodingUnit` / `TransformUnit` 类型。
+**限制**：没有 `vvdec_internals_version()` 之类的版本号，也没有任何位布局的自我描述。若将来 CB 位域、intra 编码或 GOP 出参发生变化，旧调用方无法在运行时察觉。在这种情况下只能同步升级调用方与库；引入版本机制需要在 `vvdec_internals.h` 中新增导出的版本函数，当前不存在。
 
-关键映射（内部 → 导出）：
+## 2. 最小可用示例
 
-| 导出函数 | 内部来源 | 备注 |
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <vvdec/vvdec.h>
+#include <vvdec/vvdec_internals.h>
+
+static void dump_cu_info( vvdecDecoder* dec, const vvdecFrame* frame )
+{
+  int w = 0, h = 0, log2MinCu = 0;
+
+  if( vvdec_internals_get_cb_info_layout_dec( dec, frame, &w, &h, &log2MinCu ) != VVDEC_OK )
+  {
+    return;   /* frame 不属于该 decoder，或已被 unref */
+  }
+
+  const size_t n = (size_t) w * h;
+  uint16_t*    cb = (uint16_t*) malloc( n * sizeof( uint16_t ) );
+  if( !cb )
+  {
+    return;
+  }
+
+  if( vvdec_internals_get_cb_info_dec( dec, frame, cb ) == VVDEC_OK )
+  {
+    for( int y = 0; y < h; y++ )
+    {
+      for( int x = 0; x < w; x++ )
+      {
+        const uint16_t v = cb[y * w + x];
+        if( !( v & ( 1 << 6 ) ) )   /* bit 6 = CU 左上角标记，其余格子为 0 */
+        {
+          continue;
+        }
+        const int cuW = 1 << ( ( v & 0x7 ) + 2 );
+        const int cuH = 1 << ( ( ( v >> 3 ) & 0x7 ) + 2 );
+        printf( "%4d %4d  %2dx%-2d  pred=%d qt=%d mt=%d skip=%d\n",
+                x << log2MinCu, y << log2MinCu, cuW, cuH,
+                ( v >> 7 ) & 0x3, ( v >> 9 ) & 0x7, ( v >> 12 ) & 0x7, v >> 15 );
+      }
+    }
+  }
+  free( cb );
+}
+
+int main( void )
+{
+  vvdecParams params;
+  vvdec_params_default( &params );
+
+  vvdecDecoder* dec = vvdec_decoder_open( &params );
+  if( !dec )
+  {
+    return 1;
+  }
+
+  vvdecAccessUnit* au = vvdec_accessUnit_alloc();
+  vvdec_accessUnit_alloc_payload( au, 4 << 20 );
+
+  /* 逐个 access unit：填 au->payload / au->payloadSize / au->payloadUsedSize */
+  vvdecFrame* frame = NULL;
+  int         ret   = vvdec_decode( dec, au, &frame );
+
+  if( frame )
+  {
+    dump_cu_info( dec, frame );        /* 查询必须在 unref 之前完成 */
+    vvdec_frame_unref( dec, frame );   /* unref 后 Picture 归还，查询全部失效 */
+  }
+
+  /* 码流结束后重复调用 vvdec_flush( dec, &frame ) 直到返回 VVDEC_EOF */
+
+  vvdec_decoder_close( dec );
+  vvdec_accessUnit_free_payload( au );
+  vvdec_accessUnit_free( au );
+  return 0;
+}
+```
+
+## 3. 调用契约
+
+### 3.1 frame 的来源
+
+所有带 `const vvdecFrame* frame` 参数的函数都通过解码器内部的 frame 列表把 `vvdecFrame*` 反查回 `Picture*`：
+
+- `frame` 必须是**同一个** `decoder` 通过 `vvdec_decode` / `vvdec_flush` 返回的指针。
+- 传入其他解码器返回的 frame、栈上伪造的 frame，或已经 `vvdec_frame_unref` 过的 frame，反查失败，函数返回 `VVDEC_ERR_INITIALIZE`。
+- `vvdec_flush` 返回的帧同样可以查询。
+
+### 3.2 时间窗口
+
+`vvdec_frame_unref` 会解除对该 `Picture` 的应用层锁定（`releasePicture` 只清 `lockedByApplication`），之后这块内存可被后续解码重用，所有 internals 查询结果失效。因此顺序固定为：
+
+```
+vvdec_decode -> 查询 -> vvdec_frame_unref
+```
+
+### 3.3 Picture 保留
+
+启用 internals（`VVDEC_INTERNALS_ENABLED`）时，解码器会把内部 `Picture` 一直保留到应用调用 `vvdec_frame_unref`，包括 8bit 输出走独立输出缓冲区的情形；未启用时，8bit 帧在拷贝到输出缓冲区后立刻解锁 `Picture`，使其可被后续解码重用。这是 internals 查询能读到结构信息的先决条件。
+
+### 3.4 线程
+
+单次查询是纯只读，不解锁、不阻塞。可以在不同解码器实例上并发调用；同一实例内应在 `vvdec_decode` / `vvdec_flush` 返回之后调用，不要与正在进行的解码并发。
+
+## 4. 网格约定
+
+两套网格，都是行优先、`idx = y * width + x`。
+
+### 4.1 CTU 网格
+
+- `widthInCtbs` = 图像宽度方向的 CTU 数，`heightInCtbs` = 高度方向。
+- `log2CtuSize` = CTU 尺寸的 log2（`6` 表示 64x64）。
+- 缓冲区长度 `widthInCtbs * heightInCtbs`，元素类型 `uint16_t`。
+
+### 4.2 min-CU 网格
+
+- 单元固定为 4x4 亮度样点（`log2MinCuSize` 恒为 2）。
+- `widthInMinCUs = (lumaWidth + minCUWidth - 1) >> log2MinCuSize`，高度同理，即**向上取整**。
+- 每个格子映射到覆盖该位置的 `CodingUnit`。
+- 缓冲区长度 `widthInMinCUs * heightInMinCUs`。
+- 落在图像实际宽高之外的尾格（宽高不是 4 的倍数时）在 CB 表中写 0，在 PB 表中写 `refIdx = -1, mv = 0`，在 intra 表中写 0，在 TU 表中写 0。
+
+CB / PB / intra / TU 四类数据共用同一套 min-CU 网格，四个 layout 函数返回的尺寸完全一致。
+
+## 5. API 参考
+
+### 5.1 函数总表
+
+| # | 函数 | 网格 | 数组出参 | 数组长度 |
+|---|---|---|---|---|
+| 1 | `vvdec_internals_get_ctb_info_layout_dec` | CTU | 无（3 个标量） | — |
+| 2 | `vvdec_internals_get_ctb_slice_idx_dec` | CTU | 1 个 `uint16_t*` | `widthInCtbs*heightInCtbs` |
+| 3 | `vvdec_internals_get_cb_info_layout_dec` | min-CU | 无（3 个标量） | — |
+| 4 | `vvdec_internals_get_cb_info_dec` | min-CU | 1 个 `uint16_t*` | `widthInMinCUs*heightInMinCUs` |
+| 5 | `vvdec_internals_get_pb_info_layout_dec` | min-CU | 无（3 个标量） | — |
+| 6 | `vvdec_internals_get_pb_info_dec` | min-CU | 6 个 `int16_t*` | `widthInMinCUs*heightInMinCUs` |
+| 7 | `vvdec_internals_get_intra_dir_info_layout_dec` | min-CU | 无（3 个标量） | — |
+| 8 | `vvdec_internals_get_intra_dir_info_dec` | min-CU | 2 个 `uint8_t*` | `widthInMinCUs*heightInMinCUs` |
+| 9 | `vvdec_internals_get_tu_info_layout_dec` | min-CU | 无（3 个标量） | — |
+| 10 | `vvdec_internals_get_tu_info_dec` | min-CU | 1 个 `uint8_t*` | `widthInMinCUs*heightInMinCUs` |
+| 11 | `vvdec_internals_get_gop_info_dec` | 帧 | `refPocL0[16]`、`refPocL1[16]` | 固定 16 |
+| 12 | `vvdec_internals_get_gop_info_headeronly` | 帧 | `refPocL0[16]`、`refPocL1[16]` | 固定 16 |
+| 13 | `vvdec_internals_get_image_dts_dec` | 帧 | 无 | — |
+
+四个 min-CU 布局函数（#3/#5/#7/#9）是同一份实现：#5/#7/#9 直接调用 #3。用哪一个都行，建议按用途调用以便阅读。
+
+### 5.2 返回码
+
+| 返回码 | 值 | 触发条件 |
 |---|---|---|
-| `get_ctu_layout` | `Picture::cs->pcv->widthInCtus`、`heightInCtus`、`sps->CTUSize` | `CodingStructure.h`、`CtuData::ctuIdx` |
-| `get_ctu_slice_idx` | 每个 CTU 的 `CtuData::slice->sliceIdx` | `CtuData` 在 `CodingStructure.h:85` |
-| `get_cu_layout` | `sps::MaxCUDepth`，min CU size = CTUSize >> MaxCUDepth | |
-| `get_cu_info` | 遍历 `CtuData::firstCU` → `CodingUnit::next`；在 min-CU 网格上把 `_predMode`、`PartSize`（由 splitSeries / depth 推导）、`depth` 打包进 uint16_t | `Unit.h:314` |
-| `get_pb_info` | `CodingUnit::mv[][]`、`refIdx[]`、`interDir()` | `Unit.h:332-345` |
-| `get_intra_dir_info` | `CodingUnit::intraDir[MAX_NUM_CHANNEL_TYPE]` | `Unit.h:336` |
-| `get_tu_info` | 遍历 `CodingUnit::firstTU` → `TransformUnit::next`；打包 transform depth | `Unit.h:285` |
-| `get_gop_info` | `Slice::TLayer`、`nalType`、`Slice::sliceType`、参考图像列表取自 `Slice::getRefPicListL0/L1` | `Slice.h` |
-| `get_image_dts` | 若存在 `Picture::dts`，否则 -1 | |
+| `VVDEC_OK` | 0 | 成功 |
+| `VVDEC_ERR_INITIALIZE` | -2 | `dec` 为 `NULL`；`frame` 为 `NULL`；`frame` 不属于该解码器或已 unref；图片无 slice 数据；header-only getter 尚无已完成图片 |
+| `VVDEC_ERR_PARAMETER` | -7 | 必需的数组出参为 `NULL` |
 
-实现必须：
+`VVDEC_ERR_PARAMETER` 只在填表类函数中出现（#2/#4/#6/#8/#10）。布局函数与 GOP 函数不检查数组指针是否为 `NULL`——它们把数组出参当可空出参处理，`NULL` 表示跳过。
 
-- **只读**：绝不修改解码器状态。
-- **null 安全**：若 `frame == NULL` 或底层 `Picture` 未保留，直接返回不写入。
-- 从 `vvdecFrame` 获取 `Picture*`：`VVDecImpl` 保存 `FrameListEntry = tuple<vvdecFrame, Picture*>`（`vvdecimpl.h:203`）；internals 实现需要从 `vvdecFrame*` 查到 `Picture*`。在 `vvdecimpl.cpp` 暴露私有 helper `vvdecimpl_get_picture(vvdecFrame*)`（文件作用域，不导出），由 `vvdec_internals.cpp` 调用。
-
-### 3. CMake 接线（`source/Lib/vvdec/CMakeLists.txt`）
-
-- 把 `vvdec_internals.cpp` 加入 `SRC_FILES`。
-- 把 `vvdec_internals.h`（由 `vvdec_internals.h.in` 生成，与 `vvdec.h.in` 使用的 `.h.in` 约定一致）加入 `INC_FILES` 和已安装公共头集合。
-- 用 `VVDEC_ENABLE_INTERNALS`（默认 `OFF`）门控编译，这样不需要分析的 release 构建不会引入额外表面。`OFF` 时符号直接缺失 — 消费端通过 `QLibrary::resolve` 返回 null 检测，与 `libde265-internals` 完全一致。
-
-```cmake
-option( VVDEC_ENABLE_INTERNALS "Build VVdeC with internals analysis API (vvdec_internals_*)" OFF )
-if( VVDEC_ENABLE_INTERNALS )
-  list( APPEND SRC_FILES vvdec_internals.cpp )
-  list( APPEND INC_FILES ${CMAKE_CURRENT_SOURCE_DIR}/vvdec_internals.h )
-  target_compile_definitions( ${LIB_NAME} PUBLIC VVDEC_INTERNALS_ENABLED )
-endif()
-```
-
-### 4. 头文件安装
-
-在顶层安装规则中（`vvdec.h` 安装到 `include/vvdec/` 的位置），同时安装 `vvdec_internals.h`，使下游消费端可 `#include <vvdec/vvdec_internals.h>`。
-
-### 5. 库命名（可选，推荐）
-
-当 `VVDEC_ENABLE_INTERNALS=ON` 时，设置不同的输出名，使 YUView 可优先加载 internals 变体：
-
-```cmake
-if( VVDEC_ENABLE_INTERNALS )
-  set_target_properties( ${LIB_NAME} PROPERTIES OUTPUT_NAME vvdec-internals )
-else()
-  set_target_properties( ${LIB_NAME} PROPERTIES OUTPUT_NAME vvdec )
-endif()
-```
-
-这镜像了 `libde265-internals` / `libde265`，让 YUView 的 `getLibraryNames()` 返回 `["vvdec-internals", "vvdec"]`。internals 变体是超集（仍导出所有 `vvdec_*` 符号），故为直接替换。
-
-## YUView 侧改动
-
-### 1. 新增外部头 `YUViewLib/src/decoder/externalHeader/vvdec/vvdec_internals.h`
-
-复制 VVdeC 安装的 `vvdec_internals.h`。这是 `externalHeader/libde265/de265_internals.h` 和 `externalHeader/libVTMDecoder.h` 已有的模式。
-
-### 2. 扩展 `decoderVVDec.h` / `.cpp`
-
-镜像 `decoderLibde265.h:68-90`（`lib` 函数指针 struct）和 `decoderLibde265.cpp:524`（`cacheStatistics`）的结构。
-
-在 `decoderVVDec.h`：
-
-- 在库函数指针 struct（由 `resolveLibraryFunctionPointers()` 填充）中添加：
-
-```cpp
-// vvdec internals 函数指针（仅在存在时 resolve）
-int  (*vvdec_internals_version)(){nullptr};
-void (*vvdec_internals_get_ctu_layout)(const vvdecFrame *, int *, int *, int *){nullptr};
-void (*vvdec_internals_get_ctu_slice_idx)(const vvdecFrame *, uint16_t *){nullptr};
-void (*vvdec_internals_get_cu_layout)(const vvdecFrame *, int *, int *, int *){nullptr};
-void (*vvdec_internals_get_cu_info)(const vvdecFrame *, uint16_t *){nullptr};
-void (*vvdec_internals_get_pb_layout)(const vvdecFrame *, int *, int *, int *){nullptr};
-void (*vvdec_internals_get_pb_info)(const vvdecFrame *, int16_t *, int16_t *, int16_t *, int16_t *, int16_t *, int16_t *, int16_t *){nullptr};
-void (*vvdec_internals_get_intra_dir_layout)(const vvdecFrame *, int *, int *, int *){nullptr};
-void (*vvdec_internals_get_intra_dir_info)(const vvdecFrame *, uint8_t *, uint8_t *){nullptr};
-void (*vvdec_internals_get_tu_info_layout)(const vvdecFrame *, int *, int *, int *){nullptr};
-void (*vvdec_internals_get_tu_info_info)(const vvdecFrame *, uint8_t *){nullptr};
-void (*vvdec_internals_get_gop_info)(const vvdecFrame *, int *, int *, int *, int *, int *, int *, int[16], int[16]){nullptr};
-int64_t (*vvdec_internals_get_image_dts)(const vvdecFrame *){nullptr};
-```
-
-- 添加镜像 `decoderVTM.h:123-129` 的成员：
-
-```cpp
-void cacheStatistics(const vvdecFrame *frame);
-bool internalsSupported{false};
-void fillStatisticList(stats::StatisticsData &statisticsData) const override;
-```
-
-- 在 `resolveLibraryFunctionPointers()` 中：以 `optional = true` resolve 每个 `vvdec_internals_*` 符号。仅当**所有**必需 internals 符号都 resolve 成功时才置 `internalsSupported = true`（与 `decoderLibde265.cpp:166` 对 `de265_internals_*` 的规则相同）。
-
-- 在 `getLibraryNames()` 中：所有平台返回 `["vvdec-internals", "vvdec"]`（mac 加 `.dylib` 后缀变体），镜像 `decoderLibde265.cpp:1007`。
-
-### 3. `cacheStatistics` 实现
-
-把 `decoderLibde265::cacheStatistics`（`decoderLibde265.cpp:524-840`）移植到 VVdeC。结构相同：
-
-1. `get_ctu_layout` → 分配 CTU 网格缓冲区。
-2. `get_ctu_slice_idx` → 写 `sliceIdx` 统计（stat ID 0）。
-3. `get_cu_layout` + `get_cu_info` → 遍历 min-CU 网格，解包 `predMode`/`partSize`/`depth`，递归划分树（复用 `decoderLibde265.cpp:765` 的 `cacheStatistics_TUTree_recursive` 模式）。
-4. `get_pb_layout` + `get_pb_info` → 运动矢量（`mvL0`/`mvL1`）、`refIdx`、`interDir`。
-5. `get_intra_dir_layout` + `get_intra_dir_info` → `intraDirLuma`（ID 9）、`intraDirChroma`（ID 10）。
-6. `get_tu_info` → `transformDepth`（ID 11）。
-7. `get_gop_info` → 为 GOP 图填充 `GOPFrame`（镜像 `decoderLibde265` 在 `HEVCGOPScanner.h:50` 的 GOP 用法）。
-
-### 4. `fillStatisticList` 实现
-
-逐字移植 `decoderLibde265::fillStatisticList`（`decoderLibde265.cpp:890-986`）— 相同 stat ID、相同颜色映射、相同描述。这样跨解码器叠加层可对比（libde265 与 VVdeC 渲染的 CU pred-mode 块使用相同 colormap）。
-
-统计类型目录（ID 与 `decoderLibde265` 对齐）：
-
-| ID | 名称 | 来源 | 说明 |
-|---|---|---|---|
-| 0 | Slice Index | `get_ctu_slice_idx` | 逐 CTU 的 slice index |
-| 1 | Part Size | `get_cu_info`（打包） | CU 划分尺寸 |
-| 2 | Pred Mode | `get_cu_info`（打包） | intra/inter/skip |
-| 3 | Intra Mode Luma | `get_intra_dir_info` | luma intra 方向 |
-| 4 | Intra Mode Chroma | `get_intra_dir_info` | chroma intra 方向 |
-| 5 | Inter Dir | `get_pb_info` | L0/L1/bi |
-| 6 | RefIdx L0 | `get_pb_info` | L0 参考索引 |
-| 7 | RefIdx L1 | `get_pb_info` | L1 参考索引 |
-| 8 | MV L0 | `get_pb_info` | L0 运动矢量 |
-| 9 | MV L1 | `get_pb_info` | L1 运动矢量 |
-| 10 | Transform Depth | `get_tu_info` | 变换树中的 TU 深度 |
-
-> 注：实现前需与 `decoderLibde265::fillStatisticList`（`decoderLibde265.cpp:890`）核对确切 ID 编号 — 上表是目标对齐，但 libde265 的 ID 可能略有出入。目标是：**相同语义的统计 → 在 libde265/HM/VVdeC 间使用相同 ID**，以便 YUView 的叠加层渲染代码共享。
-
-## VVC 新增结构划分支持（数据结构 + 绘制）
-
-VVC 相对 HEVC 在编码结构上有大量新增。本节列出 VVC 独有的、需要 internals API 暴露并在 YUView 侧新增绘制支持的字段。**这是本 API 与 `libde265-internals` 的关键差异点** —— 仅移植 HEVC 字段不足以表达 VVC 编码结构。
-
-### 1. CU 划分树：QTMT（Quad-Tree + Multi-Type Tree）
-
-VVC 用 QTMT 取代 HEVC 的纯四叉树。`CodingUnit::splitSeries`（`Unit.h:338`，类型 `SplitSeries = uint16_t`）以 5-bit/level 的位打包形式编码从 CTU 到当前 CU 的完整划分序列。
-
-**VVdeC 内部数据结构**（`CommonDef.h:348`、`UnitPartitioner.h:66`）：
+### 5.3 CTB（CTU）：布局与 slice index
 
 ```c
-// 每层划分类型占 5 bit（SPLIT_DMULT=5, SPLIT_MASK=31）
-enum PartSplit {
-  CTU_LEVEL        = 0,   // CTU 根
-  CU_QUAD_SPLIT,          // 四叉树（HEVC 也有）
-  CU_HORZ_SPLIT,          // 水平二叉（VVC 新增）
-  CU_VERT_SPLIT,          // 垂直二叉（VVC 新增）
-  CU_TRIH_SPLIT,          // 水平三叉（VVC 新增）
-  CU_TRIV_SPLIT,          // 垂直三叉（VVC 新增）
-  TU_MAX_TR_SPLIT,        // TU 变换分割
-  TU_NO_ISP, TU_1D_HORZ_SPLIT, TU_1D_VERT_SPLIT,  // ISP
-  SBT_VER_HALF_POS0_SPLIT ... SBT_HOR_QUAD_POS1_SPLIT,  // SBT
-};
-// splitSeries = Σ (split_at_depth_d << (d * 5))
-// 解码：从低到高每 5 bit 取一个 PartSplit，直到 CTU_LEVEL 或到达 CU 深度
+int vvdec_internals_get_ctb_info_layout_dec( vvdecDecoder *dec,
+                                             const vvdecFrame *frame,
+                                             int *widthInCtbs,     /* 可空 */
+                                             int *heightInCtbs,    /* 可空 */
+                                             int *log2CtuSize );   /* 可空 */
+
+int vvdec_internals_get_ctb_slice_idx_dec( vvdecDecoder *dec,
+                                           const vvdecFrame *frame,
+                                           uint16_t *out );      /* 必须非空 */
 ```
 
-**API 需暴露**（新增，超出 libde265 对齐集合）：
+- `widthInCtbs` / `heightInCtbs`：CTU 网格尺寸。
+- `log2CtuSize`：CTU 边长 log2，`1 << log2CtuSize` 得到像素边长（典型 64 → 6）。
+- `out`：逐 CTU 写入覆盖该 CTU 的 slice 的**独立 slice 序号**（`slice->getIndependentSliceIdx()`，图片内的 slice 编号）。没有任何 slice 覆盖的 CTU 写 0。
+
+两次调用模式：
 
 ```c
-// 获取 min-CU 网格上每个 CU 的 splitSeries（用于重建划分边界）
-VVDEC_DECL void vvdec_internals_get_cu_split_series(
-    const vvdecFrame *frame, uint16_t *out_split_series);
-// out_split_series[i] = min-CU 网格第 i 格所属 CU 的 splitSeries
-// 调用方按 spec §6.4.1 解码此值重建划分树
+int w, h, log2Ctu;
+vvdec_internals_get_ctb_info_layout_dec( dec, frame, &w, &h, &log2Ctu );
+uint16_t* sliceIdx = malloc( w * h * sizeof( uint16_t ) );
+vvdec_internals_get_ctb_slice_idx_dec( dec, frame, sliceIdx );
 ```
 
-**YUView 侧绘制**：
-
-- 当前 `paintStatisticsData`（`StatisticsDataPainting.cpp:252`）只画矩形 `drawRect`（`displayRect`）。二叉/三叉分割的子块**仍是矩形**，所以 part-size 叠加层用 min-CU 网格 + `splitSeries` 解码后的 CU 边界即可，无需新绘制原语。
-- 新增统计类型 `Partition Tree`（建议 ID 12），绘制 CU 边界线（用 `gridStyle`，`StatisticsType.h:133`）。颜色按 `splitSeries` 末层 split 类型分色（QT=蓝、BT=绿、TT=红）。
-
-### 2. VVC 独有的 Intra 模式
-
-VVC intra 预测模式数从 HEVC 的 35 扩展到 67+，并新增 MIP、ISP、BDPCM 三类。
-
-**VVdeC 内部数据结构**（`CommonDef.h:230`、`Unit.h:336/359/364`）：
+### 5.4 CB（CU）：布局与位域
 
 ```c
-// intraDir[] 取值范围（luma）：
-//   0      = INTRA_PLANAR
-//   1      = INTRA_DC
-//   2..66  = INTRA_ANGULAR_2..34（65 个方向模式）
-// chroma 额外：LM_CHROMA_IDX=67, DM_CHROMA_IDX=68
-static const int NUM_LUMA_MODE    = 67;
-static const int MAX_NUM_MIP_MODE = 32;
+int vvdec_internals_get_cb_info_layout_dec( vvdecDecoder *dec,
+                                            const vvdecFrame *frame,
+                                            int *widthInMinCUs,    /* 可空 */
+                                            int *heightInMinCUs,   /* 可空 */
+                                            int *log2MinCuSize );  /* 可空，恒为 2 */
 
-// CU 上的标志位（Unit.h）
-bool    _mipTranspose;   // MIP 转置标志
-int8_t  intraDir[2];     // [0]=luma [1]=chroma（MAX_NUM_CHANNEL_TYPE=2）
-uint8_t _bdpcmL : 2;     // luma BDPCM 模式
-uint8_t _bdpcmC : 2;     // chroma BDPCM 模式
+int vvdec_internals_get_cb_info_dec( vvdecDecoder *dec,
+                                     const vvdecFrame *frame,
+                                     uint16_t *out );          /* 必须非空 */
 ```
 
-**API 需暴露**（扩展 `get_intra_dir_info` 的输出）：
+每个 min-CU 格一个 `uint16_t`。只有 CU 左上角那一格带完整信息（bit 6 置 1），被同一个 CU 覆盖的其他格子写 0。遍历时必须先判断 bit 6。
 
-```c
-// 在现有 intraDir luma/chroma 之外，新增 MIP/BDPCM 标志
-VVDEC_DECL void vvdec_internals_get_intra_mode_flags(
-    const vvdecFrame *frame,
-    uint8_t *out_mip_flag,      // 1 = 该 CU 用 MIP
-    uint8_t *out_mip_transpose, // MIP 转置
-    uint8_t *out_bdpcm_luma,    // 0=无 1=水平 2=垂直
-    uint8_t *out_bdpcm_chroma);
-```
+位布局：
 
-**YUView 侧绘制**：
-
-- `fillStatisticList` 中 `intraDirC`（ID 3）的 `valueRange` 从 HEVC 的 35 扩到 68，颜色映射需重做（`decoderLibde265.cpp:960` 现有的 35 项 `PredefinedType::Jet` 不够）。
-- 新增统计类型 `MIP Mode`（建议 ID 13）、`BDPCM`（建议 ID 14）。
-- MIP 的 32 个子模式若需可视化，单独 ID 15。
-
-### 3. VVC 独有的 Inter 模式
-
-VVC 新增 Affine、MMVD、Geo (GPM)、IBC 四类 inter 预测，运动模型从 1 个 MV/方向 扩展到 3 个（仿射控制点）。
-
-**VVdeC 内部数据结构**（`Unit.h:332/340/341/348`）：
-
-```c
-Mv      mv[NUM_REF_PIC_LIST_01][3];  // [list][0..2]，仿射用 3 个控制点
-uint8_t geoSplitDir;                  // Geo 分割方向（0..7）
-uint8_t mmvdIdx;                      // MMVD 候选索引
-uint8_t _mergeType : 2;               // 普通/子块/IBC/Geo
-// MotionInfo.h: refIdx, mv, interDir, affineType, bcwIdx, ...
-```
-
-**API 需暴露**（扩展 `get_pb_info`）：
-
-```c
-// 现有 get_pb_info 返回 1 个 mv/方向；仿射需 3 个
-VVDEC_DECL void vvdec_internals_get_pb_info_ex(
-    const vvdecFrame *frame,
-    int16_t *mvL0_cp0_x, int16_t *mvL0_cp0_y,  // 控制点 0（左上）
-    int16_t *mvL0_cp1_x, int16_t *mvL0_cp1_y,  // 控制点 1（右上）
-    int16_t *mvL0_cp2_x, int16_t *mvL0_cp2_y,  // 控制点 2（左下，仅仿射）
-    int16_t *mvL1_cp0_x, int16_t *mvL1_cp0_y,
-    int16_t *mvL1_cp1_x, int16_t *mvL1_cp1_y,
-    int16_t *mvL1_cp2_x, int16_t *mvL1_cp2_y,
-    int16_t *refIdxL0, int16_t *refIdxL1,
-    int16_t *interDir,
-    uint8_t *mergeType,    // 0=普通 1=子块 2=IBC 3=Geo
-    uint8_t *geoSplitDir,  // Geo 方向
-    uint8_t *mmvdIdx);
-```
-
-**YUView 侧绘制**：
-
-- `FrameTypeData::addBlockAffineTF`（`FrameTypeData.h:126`）已存在，**可直接复用**绘制仿射运动场（3 控制点插值）。这是 YUView 已有的能力，只需在 `cacheStatistics` 中检测 `mergeType == AFFINE` 时调用。
-- 新增统计类型 `Merge Type`（建议 ID 16，值 0-3）、`Geo Split Dir`（建议 ID 17，值 0-7）。
-- Geo 分割线（非矩形）需用 `polygonValueData`（`FrameTypeData.h:150`）—— YUView 已支持多边形绘制，用于 Geo 的三角形/四边形子块。
-
-### 4. VVC 独有的 Transform 结构
-
-VVC 新增 MTS（多变换集）、LFNST（低频不可分离变换）、SBT（子块变换）、ISP（子分区变换）。
-
-**VVdeC 内部数据结构**（`Unit.h:285` `TransformUnit`）：
-
-```c
-struct TransformUnit : public UnitArea {
-  uint8_t _chType : 2;
-  uint8_t jointCbCr : 2;     // jointCbCr 残差
-  uint8_t _mtsIdx : 2;       // MTS 索引
-  uint8_t _lfnstIdx : 2;     // LFNST 索引
-  uint8_t sbtInfo : 4;       // SBT 模式（水平/垂直 + 半/四分 + 位置）
-  // ...
-};
-```
-
-**API 需暴露**：
-
-```c
-VVDEC_DECL void vvdec_internals_get_tu_info_ex(
-    const vvdecFrame *frame,
-    uint8_t *out_mts_idx,     // 0=DCT2 1-5=MTS 集
-    uint8_t *out_lfnst_idx,   // 0=无 1/2=水平/垂直
-    uint8_t *out_sbt_info,    // 编码 SBT
-    uint8_t *out_isp_mode,    // 0=无 1=水平 2=垂直
-    uint8_t *out_jcbcr);      // jointCbCr
-```
-
-**YUView 侧绘制**：
-
-- 现有 `transformDepth`（ID 10）保留。
-- 新增 `MTS Index`（ID 18）、`LFNST Index`（ID 19）、`SBT Mode`（ID 20）、`ISP Mode`（ID 21）、`JointCbCr`（ID 22）。
-
-### 5. VVdeC internals API 完整统计类型目录（含 VVC 扩展）
-
-| ID | 名称 | 来源 | VVC 新增？ |
-|---|---|---|---|
-| 0 | Slice Index | `get_ctu_slice_idx` | 否 |
-| 1 | Part Size | `get_cu_info` | 否（但取值集扩展） |
-| 2 | Pred Mode | `get_cu_info` | 否（新增 IBC） |
-| 3 | Intra Mode Luma | `get_intra_dir_info` | 否（范围扩到 67） |
-| 4 | Intra Mode Chroma | `get_intra_dir_info` | 否（范围扩到 68） |
-| 5 | Inter Dir | `get_pb_info` | 否 |
-| 6 | RefIdx L0 | `get_pb_info` | 否 |
-| 7 | RefIdx L1 | `get_pb_info` | 否 |
-| 8 | MV L0 | `get_pb_info` | 否（仿射需 3 控制点） |
-| 9 | MV L1 | `get_pb_info` | 否（仿射需 3 控制点） |
-| 10 | Transform Depth | `get_tu_info` | 否 |
-| **12** | **Partition Tree** | `get_cu_split_series` | **是** |
-| **13** | **MIP Mode** | `get_intra_mode_flags` | **是** |
-| **14** | **BDPCM** | `get_intra_mode_flags` | **是** |
-| **15** | **MIP Sub-Mode** | `get_intra_mode_flags` | **是** |
-| **16** | **Merge Type** | `get_pb_info_ex` | **是** |
-| **17** | **Geo Split Dir** | `get_pb_info_ex` | **是** |
-| **18** | **MTS Index** | `get_tu_info_ex` | **是** |
-| **19** | **LFNST Index** | `get_tu_info_ex` | **是** |
-| **20** | **SBT Mode** | `get_tu_info_ex` | **是** |
-| **21** | **ISP Mode** | `get_tu_info_ex` | **是** |
-| **22** | **JointCbCr** | `get_tu_info_ex` | **是** |
-
-> ID 11 保留给 `transformDepth`（与 libde265 对齐，见 `decoderLibde265.cpp:982`）。VVC 新增项从 12 起。
-
-### 6. 绘制原语复用情况
-
-| VVC 结构 | YUView 现有绘制原语 | 是否需新增 |
+| 位 | 字段 | 含义 |
 |---|---|---|
-| QT/BT/TT CU 边界 | `drawRect`（矩形） | 否，子块仍是矩形 |
-| Affine 运动场 | `addBlockAffineTF`（3 控制点） | 否，已存在 |
-| Geo 分割子块 | `polygonValueData`（多边形） | 否，已存在 |
-| MIP/ISP/SBT 块 | `drawRect` + 颜色映射 | 否 |
-| LFNST/MTS 块 | `drawRect` + 颜色映射 | 否 |
+| 0-2 | `log2(cuWidth) - 2` | 0=4, 1=8, 2=16, 3=32, 4=64 |
+| 3-5 | `log2(cuHeight) - 2` | 同上；VVC 允许非方 CU，宽高分别编码 |
+| 6 | origin | 1 = 该格是 CU 的左上角 |
+| 7-8 | predMode | 0=INTER, 1=INTRA, 2=IBC |
+| 9-11 | qtDepth | 四叉树深度 |
+| 12-14 | MT depth | `cu->depth - cu->qtDepth`，即 QT 叶子以下的 BT/TT 深度，**不含** QT 深度 |
+| 15 | skip | 1 = skip 模式 |
 
-**结论**：YUView 现有绘制基础设施（`StatisticsDataPainting.cpp`）**无需新增原语**即可支持所有 VVC 结构。工作量集中在 internals API 数据采集 + `fillStatisticList` 注册新 `StatisticsType`。
+解包：
 
-## TODO：按 spec 对齐的划分树遍历
+```c
+const int log2W    = ( v & 0x7 ) + 2;
+const int log2H    = ( ( v >> 3 ) & 0x7 ) + 2;
+const int origin   = ( v >> 6 ) & 1;
+const int predMode = ( v >> 7 ) & 0x3;
+const int qtDepth  = ( v >> 9 ) & 0x7;
+const int mtDepth  = ( v >> 12 ) & 0x7;
+const int skip     = ( v >> 15 ) & 1;
+```
 
-`splitSeries` 解码需严格按 ITU-T H.266/VVC §6.4.1（"Partition tree derivation process"）。首版可先用 min-CU 网格打包渲染 part-size 叠加层；递归树遍历（`cacheStatistics_partitionTree_recursive`，仿 `decoderLibde265.cpp:765` 的 `cacheStatistics_TUTree_recursive`）作为 ID 12 的精确实现延后。
+`predMode` 取值为 `PredMode` 枚举原值（`MODE_INTER=0`、`MODE_INTRA=1`、`MODE_IBC=2`）。QT 深度与 MT 深度各占 3 bit，写入时按 `& 0x7` 截断，最大只能表达 7。
 
-**关键约束**：三叉分割（`CU_TRIH_SPLIT`/`CU_TRIV_SPLIT`）的中间块尺寸为 (size/4, size/2, size/4)，不是均分；二叉分割是均分。`splitSeries` 解码时必须按 spec 处理这个不对称性，否则边界画错。
+### 5.5 PB（PU）：运动信息
 
-## 防御性实现要点
+```c
+int vvdec_internals_get_pb_info_layout_dec( vvdecDecoder *dec,
+                                            const vvdecFrame *frame,
+                                            int *widthInMinCUs,    /* 可空 */
+                                            int *heightInMinCUs,   /* 可空 */
+                                            int *log2MinCuSize );  /* 可空 */
 
-- **空帧**：每个 `vvdec_internals_*` 函数必须在 `frame == NULL` 时提前返回（YUView 在首帧可用前就会调用 `cacheStatistics`）。
-- **版本检查**：YUView 必须先调用 `vvdec_internals_version()`，若 `< VVDEC_INTERNALS_MIN_VERSION` 则拒绝使用 internals。在 YUView 中定义 `VVDEC_INTERNALS_MIN_VERSION 1`。
-- **过期图像**：`vvdecimpl.cpp:1535` 注明 `vvdecFrame` "may still be used internally after already returned to the caller."。internals 实现不得假设独占所有权；只读不写。
-- **线程**：YUView 的缓存解码器在 worker 线程运行。internals API 必须支持在*不同*解码器实例上与 `vvdec_decode` 并发调用；同一实例内，YUView 只在 `vvdec_decode` 返回帧后调用 `cacheStatistics`，故无实例内并发。需文档化此契约。
-- **符号解析是唯一判据**：按 AGENTS.md 约定（`decoderLibde265.cpp:166`），`internalsSupported` 由 `vvdec_internals_*` 符号能否通过 `QLibrary::resolve` 决定，**而非**库文件名。`getLibraryNames()` 中 `vvdec-internals` vs `vvdec` 的名称偏好仅是加载顺序提示。
+int vvdec_internals_get_pb_info_dec( vvdecDecoder *dec,
+                                     const vvdecFrame *frame,
+                                     int16_t *out_mv0_x,     /* 必须非空 */
+                                     int16_t *out_mv0_y,     /* 必须非空 */
+                                     int16_t *out_mv1_x,     /* 必须非空 */
+                                     int16_t *out_mv1_y,     /* 必须非空 */
+                                     int16_t *out_ref_idx0,  /* 必须非空 */
+                                     int16_t *out_ref_idx1 );/* 必须非空 */
+```
 
-## 验证计划
+六个数组各 `widthInMinCUs * heightInMinCUs` 个 `int16_t`：
 
-1. 用 `VVDEC_ENABLE_INTERNALS=ON` 构建 VVdeC，确认 `vvdec-internals` 库导出 `vvdec_internals_*` 符号（如 `nm -D libvvdec-internals.so | grep vvdec_internals`）。
-2. 基于新外部头构建 YUView；确认加载 `vvdec-internals` 时 `decoderVVDec::internalsSupported` 翻转为 `true`。
-3. 解码一路 VVC 一致性流，渲染 slice-index / pred-mode / intra-dir 叠加层，与同流用 `libVTMDec`（VTM 参考解码器）解码的结果视觉对比 — 叠加层必须一致。
-4. 运行 YUView 单元测试：`./build/YUViewUnitTest/YUViewUnitTest --gtest_filter=StatisticsFile*`。
-5. 确认 `vvdec`（非 internals）库仍可加载并解码；`internalsSupported` 必须为 `false`，解码器仍能产出 YUV（internals 严格可选）。
+| 数组 | 含义 |
+|---|---|
+| `out_mv0_x` / `out_mv0_y` | L0 运动矢量，单位 1/16 亮度样点 |
+| `out_mv1_x` / `out_mv1_y` | L1 运动矢量，单位 1/16 亮度样点 |
+| `out_ref_idx0` | L0 参考索引；该列表未使用时为 -1 |
+| `out_ref_idx1` | L1 参考索引；该列表未使用时为 -1 |
 
-## 范围外（本提案不涉及）
+数据来自重建阶段写好的 **per-4x4 `MotionInfo` 运动场**，因此给出的是实际生效的 PB 运动，而不是 CU 级原始语法：
 
-- 修改现有 dtrace 系统。保持原样用于调试。
-- 改动 `vvdecFrame` 结构体布局。internals API 是旁路通道；帧结构体不动。
-- ALF/SAO 滤波器系数可视化（`CtuData::alfParam`/`saoParam`，`CodingStructure.h:87`）—— 可后续作为独立 internals API 扩展。
-- LMCS 重映射曲线可视化 —— 属于 frame 级而非 block 级统计，不在 internals API 范畴。
+- 仿射：每个 4x4 位置按控制点插值后的 MV，不是只给 CP0。
+- ATMVP / 子块时域预测：子块实际 MV。
+- GEO：各子分区各自的 MV 与 refIdx。
+- DMVR：细化后的 MV。
+
+无运动的块（intra、IBC）`refIdx = -1`、`mv = 0`。因此 `ref_idx0 < 0 && ref_idx1 < 0` 是"该格没有可用运动信息"的可靠判据，不要用 `mv == 0` 判断。
+
+**已知限制**：该运动场是解码器内部的 per-frame scratch，只有**最新重建的那一帧**保证有效；更早返回的帧可能读到过期或清零的运动数据。需要在多帧之间比对运动信息时，请在该帧返回后立即取走数据副本。
+
+### 5.6 Intra 方向
+
+```c
+int vvdec_internals_get_intra_dir_info_layout_dec( vvdecDecoder *dec,
+                                                   const vvdecFrame *frame,
+                                                   int *widthInMinCUs,    /* 可空 */
+                                                   int *heightInMinCUs,   /* 可空 */
+                                                   int *log2MinCuSize );  /* 可空 */
+
+int vvdec_internals_get_intra_dir_info_dec( vvdecDecoder *dec,
+                                            const vvdecFrame *frame,
+                                            uint8_t *out_intra_dir_y,  /* 必须非空 */
+                                            uint8_t *out_intra_dir_c );/* 必须非空 */
+```
+
+两个数组各 `widthInMinCUs * heightInMinCUs` 个 `uint8_t`。
+
+亮度 `out_intra_dir_y`：
+
+| 值 | 含义 |
+|---|---|
+| 0 | PLANAR |
+| 1 | DC |
+| 2..66 | 角度模式（65 个） |
+| 0..15 | **MIP CU**：写入原始 MIP 模式序号（实际个数取决于块尺寸：16 / 8 / 6 个） |
+
+MIP 的序号与 PLANAR/DC/角度模式**数值混叠**：MIP 模式 2 和角度模式 2 在数值上无法区分，光看这一个字节无法判断该 CU 是否用 MIP。需要使用 MIP 信息的调用方需另行获取 MIP 标志，当前 API 不导出。
+
+色度 `out_intra_dir_c`：
+
+| 值 | 含义 |
+|---|---|
+| 0 | PLANAR |
+| 1 | DC |
+| 2..66 | 角度模式 |
+| 67 | LM_CHROMA |
+| 68 | MDLM_L |
+| 69 | MDLM_T |
+| 70 | DM_CHROMA |
+
+dual tree 时读的是色度 CU 自己的模式；single tree 时亮度与色度共用同一个 CU，两者读到同一组值。无 CU 覆盖的格子写 0。
+
+### 5.7 TU：变换深度
+
+```c
+int vvdec_internals_get_tu_info_layout_dec( vvdecDecoder *dec,
+                                            const vvdecFrame *frame,
+                                            int *widthInMinCUs,    /* 可空 */
+                                            int *heightInMinCUs,   /* 可空 */
+                                            int *log2MinCuSize );  /* 可空 */
+
+int vvdec_internals_get_tu_info_dec( vvdecDecoder *dec,
+                                     const vvdecFrame *frame,
+                                     uint8_t *out );           /* 必须非空 */
+```
+
+`out` 为 `widthInMinCUs * heightInMinCUs` 个 `uint8_t`，每格直接存放该位置所属 TU 的相对变换深度（0 起，越大表示 TU 越小），没有位域打包。
+
+深度由 TU 相对于所属 CU 的尺寸比值推导：
+
+```
+depth = max( log2(cuWidth) - log2(tuWidth), log2(cuHeight) - log2(tuHeight) )
+```
+
+`TransformUnit` 不保存树深度，所以只能这样推：
+
+- BT/ISP 沿某一维分割时结果是正确的（另一维比值为 0）。
+- **已知近似**：TT（三叉）分割两侧的 TU 会报深一层。例如 64x64 的 CU 沿垂直方向做水平三叉，分成 64x16 / 64x32 / 64x16 三个 TU，两侧 TU 的高度比值算出来是 2，而实际树深度是 1。
+- 该格不属于任何 TU 时写 0。
+
+### 5.8 GOP：帧级查询
+
+```c
+int vvdec_internals_get_gop_info_dec( vvdecDecoder *dec,
+                                      const vvdecFrame *frame,
+                                      int *poc,             /* 可空 */
+                                      int *temporalLayer,   /* 可空 */
+                                      int *sliceType,       /* 可空 */
+                                      int *isRAP,           /* 可空 */
+                                      int *numRefPocL0,     /* 可空 */
+                                      int *numRefPocL1,     /* 可空 */
+                                      int refPocL0[16],     /* 可空 */
+                                      int refPocL1[16] );   /* 可空 */
+```
+
+所有信息取自已解码图片的第一条 slice：
+
+| 出参 | 含义 |
+|---|---|
+| `poc` | 该图片的 POC |
+| `temporalLayer` | 时间层 id |
+| `sliceType` | 0=B, 1=P, 2=I |
+| `isRAP` | 1 = CLVSS 图片（IDR / CRA / GDR），0 = 其他 |
+| `numRefPocL0` / `numRefPocL1` | 该列表有效参考项个数，可能为 0 |
+| `refPocL0` / `refPocL1` | 固定 16 项，未使用的项补 0 |
+
+要点：
+
+- `isRAP` 用的是 `isClvssPu()`，判据是 NAL unit type 落在 `IDR_W_RADL .. GDR` 区间且图片未混用 NAL 类型（默认构建 `GDR_ADJ=1` 时还要求 `no_output_before_recovery` 为真）。VVC 没有 BLA，所以 CLVSS 就是 IDR/CRA/GDR 三类；不要把 `isRAP` 再细分成 BLA。
+- `refPocL0` / `refPocL1` 无论 `numRefPoc` 是多少都写满 16 项，因此调用方无需预清零，但也必须按 `numRefPoc` 只读前若干项——多余项是 0，而 0 是合法 POC。
+- 图片没有任何 slice 时返回 `VVDEC_ERR_INITIALIZE`。
+
+### 5.9 GOP：header-only 查询
+
+```c
+int vvdec_internals_get_gop_info_headeronly( vvdecDecoder *dec,
+                                             int *poc,             /* 可空 */
+                                             int *temporalLayer,   /* 可空 */
+                                             int *sliceType,       /* 可空 */
+                                             int *nalUnitType,     /* 可空 */
+                                             int *isRAP,           /* 可空 */
+                                             int *allSlicesIntra,  /* 可空 */
+                                             int *numRefPocL0,     /* 可空 */
+                                             int *numRefPocL1,     /* 可空 */
+                                             int refPocL0[16],     /* 可空 */
+                                             int refPocL1[16],     /* 可空 */
+                                             int64_t *picSequence );/* 可空 */
+```
+
+不需要 `vvdecFrame`，直接读取解析器里"最近一张完成的图片"的状态。与帧级版本相比多了三个出参：
+
+| 出参 | 含义 |
+|---|---|
+| `nalUnitType` | 第一条 slice 的 NAL unit type 原值，可据此精确区分 IDR_W_RADL / IDR_N_LP / CRA / GDR |
+| `allSlicesIntra` | 1 = 图片内所有 slice 都是 I slice |
+| `picSequence` | 该图片完成时的单调递增序号 |
+
+`picSequence` 的用途：判断"是不是又完成了一张新图片"。解析器每完成一张图片就把计数器加一，序号只增不减，因此只需判断本次取到的值是否与上次不同。**不要用 POC 判断**：全 IDR 码流里每张图片的 POC 都是 0。
+
+前置条件：
+
+- 解码器必须处于 header-only 模式（已经调用过 `vvdec_decode_headeronly`）。普通 `vvdec_decode` 路径不会设置这张"最近完成图片"，因此该 getter 在普通模式下永远返回 `VVDEC_ERR_INITIALIZE`。
+- 至少已经完成一张图片（即某张图的最后一条 slice 已解析）。否则返回 `VVDEC_ERR_INITIALIZE`。
+- 图片因 slice 未覆盖全部 CTU 而解析失败时，它不会被当作"最近完成图片"，同样返回 `VVDEC_ERR_INITIALIZE`。
+
+### 5.10 时间戳
+
+```c
+int64_t vvdec_internals_get_image_dts_dec( const vvdecFrame *frame );
+```
+
+函数名保留了 "dts"，但**实际返回的是 CTS（coding timestamp）**：`vvdecFrame` 只携带 `cts` 和 `ctsValid`，没有 DTS 字段。`ctsValid` 为 0 或 `frame` 为 `NULL` 时返回 `-1`。
+
+## 6. header-only 模式
+
+`vvdec_decode_headeronly` 位于公共头 `include/vvdec/vvdec.h`，与 internals 开关无关（`OFF` 时也存在），但它存在的目的就是给 GOP 扫描供数，实际使用总是与 `vvdec_internals_get_gop_info_headeronly` 搭配。
+
+```c
+VVDEC_DECL int vvdec_decode_headeronly( vvdecDecoder *, vvdecAccessUnit *accessUnit, vvdecFrame **frame );
+```
+
+### 6.1 行为
+
+- 解析 slice header、构建参考图像列表、维护 DPB；跳过 CABAC slice body 解析与重建。
+- 不产生 `vvdecFrame`，`*frame` 恒为 `NULL`。
+- `accessUnit->payloadUsedSize == 0` 时立即返回 `VVDEC_OK` 且不做任何解析。这与 `vvdec_decode` 不同：后者对空 access unit 返回 `VVDEC_EOF`。用 header-only 扫码流时，EOF 由调用方自己判断（例如读到文件末尾），不要等 `VVDEC_EOF`。
+- 输入校验与 `vvdec_decode` 一致：`payload` 为 `NULL`、`payloadSize <= 0`、`payloadUsedSize > payloadSize` 都返回 `VVDEC_ERR_DEC_INPUT`。
+
+### 6.2 单向不可逆
+
+进入 header-only 模式后**不能回到普通解码**：
+
+- 模式开关是解码器上的单向状态，`vvdec_decode` 与 `vvdec_decode_headeronly` 不能在同一实例上先后混用。
+- 一旦开始调用 `vvdec_decode_headeronly`，后续只能继续调用它，直到 `vvdec_decoder_close`。
+- 该状态在 `vvdec_decoder_close` 内部被重置，因此关闭后重新 `vvdec_decoder_open` 可以正常走普通解码路径。
+
+### 6.3 内存与图片生命周期
+
+为了不让整段码流的图片都留在内存里，header-only 模式会主动回收：
+
+- 每次 `decodeHeaderOnly` 之后，解析帧列表里除"最近一张完成的图片"之外的图片立即归还图片池。
+- 因此内存占用与单帧的结构数据相当，可以扫很长的码流。
+- `vvdec_internals_get_gop_info_headeronly` 指向的图片在**下一张图片完成**或 `vvdec_decoder_close` 之前有效。要跨图片比对，请在每次调用后立刻把需要的字段取走。
+- 由于图片会立即回收，不要缓存 `picSequence` 之外的任何"当前图片"隐式状态；每轮都以 `picSequence` 变化作为触发条件重新查询。
+
+### 6.4 典型用法
+
+```c
+int64_t lastSeq = -1;
+
+for( ;; )
+{
+  /* 填 au */
+  int ret = vvdec_decode_headeronly( dec, au, &frame );   /* frame 恒为 NULL */
+  if( ret != VVDEC_OK )
+  {
+    break;
+  }
+
+  int64_t seq = 0;
+  int     poc = 0, tlayer = 0, sliceType = 0, nalType = 0, isRAP = 0, allIntra = 0;
+  int     numL0 = 0, numL1 = 0;
+  int     refPocL0[16], refPocL1[16];
+
+  if( vvdec_internals_get_gop_info_headeronly( dec, &poc, &tlayer, &sliceType, &nalType,
+                                               &isRAP, &allIntra, &numL0, &numL1,
+                                               refPocL0, refPocL1, &seq ) == VVDEC_OK
+      && seq != lastSeq )
+  {
+    lastSeq = seq;   /* 只有序号变化才代表完成了一张新图片 */
+    /* 记录 poc / nalType / isRAP / 参考 POC ... */
+  }
+}
+```
+
+## 7. 已知限制汇总
+
+| 限制 | 说明 |
+|---|---|
+| 无版本号 | 只能靠符号是否存在判断支持；位布局变化无法在运行时察觉，需同步升级调用方 |
+| 布局随版本硬编码 | CB 位域、intra 编码、TU 值域都是编译期约定，没有任何自我描述字段 |
+| PB 运动场只对最新帧有效 | per-frame scratch，早于最新重建帧的查询可能读到过期数据 |
+| MIP 与角度模式混叠 | 亮度 intra 值可能是 MIP 序号（0..15），无法与同数值的角度/PLANAR/DC 区分 |
+| TT 的 TU 深度偏深一层 | 深度由尺寸比推导，三叉分割两侧 TU 会多报一级 |
+| 内部图片生命周期依赖 unref | 查询必须在 `vvdec_frame_unref` 之前完成 |
+| `get_image_dts_dec` 名不副实 | 返回 CTS，不是 DTS |
+| header-only 不可逆 | 不能与 `vvdec_decode` 混用，且不产生帧 |
+
+## 8. YUView 统计类型映射
+
+`decoderVVDec::cacheStatistics` 目前的用法（statistics type id 与实际取值来源）：
+
+| ID | 名称 | 来源 | 取值 / 处理 |
+|---|---|---|---|
+| 0 | Slice Index | `get_ctb_slice_idx_dec` | 逐 CTU 写 `widthInCtbs*heightInCtbs` 块，值即独立 slice 序号 |
+| 1 | Pred Mode | `get_cb_info_dec` bit 7-8 | 只在 CU 左上角按 `cuW x cuH` 写一块；0=Inter, 1=Intra, 2=IBC |
+| 2 | QT Depth | `get_cb_info_dec` bit 9-11 | 同上 |
+| 3 | MT Depth | `get_cb_info_dec` bit 12-14 | 同上，不含 QT 深度 |
+| 4 | Skip | `get_cb_info_dec` bit 15 | 同上，0/1 |
+| 5 | Ref POC 0 | `get_pb_info_dec` 的 `ref_idx0` + `get_gop_info_dec` | 仅在 `0 <= refIdx0 < numRefPocL0` 时写 `refPocL0[refIdx0] - poc` |
+| 6 | Ref POC 1 | `get_pb_info_dec` 的 `ref_idx1` + `get_gop_info_dec` | 仅在 `0 <= refIdx1 < numRefPocL1` 时写 `refPocL1[refIdx1] - poc` |
+| 7 | Motion Vector 0 | `get_pb_info_dec` 的 L0 MV | 单位 1/16 亮度样点，按 CU 矩形写一块 |
+| 8 | Motion Vector 1 | `get_pb_info_dec` 的 L1 MV | 同上 |
+| 9 | Intra Dir Luma | `get_intra_dir_info_dec` 亮度 | 仅 `predMode == 1` 且 `dirY < 67` 时写；`dirY >= 2` 时另画方向向量 |
+| 10 | Intra Dir Chroma | `get_intra_dir_info_dec` 色度 | 仅 `predMode == 1` 且 `dirC <= 70` 时写 |
+| 11 | Transform Depth | `get_tu_info_dec` | 逐 min-CU 格写 `4x4` 块，相邻同值由绘制层合并 |
+
+使用注意：
+
+- 类型 1..10 都只在 CU 左上角（CB 表 bit 6）写块，块尺寸取 CB 表里的 `cuW x cuH`；类型 0 用 CTU 网格，类型 11 用 min-CU 网格。
+- 类型 5/6 依赖 `get_gop_info_dec` 成功；GOP 信息取不到时该帧跳过参考 POC 统计，其余类型不受影响。
+- 运动类统计（5..8）只在 `predMode != 1`（非 intra）时写；intra CU 的 `refIdx = -1`、`mv = 0` 不会被误当作有效运动。
+- 类型 10 的有效值域是 0..70（含 67..70 的 LM/MDLM_L/MDLM_T/DM），画色标时不需要为 CCLM 预留 81..83。

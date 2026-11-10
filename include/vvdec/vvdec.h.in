@@ -614,6 +614,12 @@ VVDEC_DECL int vvdec_decode( vvdecDecoder *, vvdecAccessUnit *accessUnit, vvdecF
    produced (frame is always set to NULL). Use
    vvdec_internals_get_gop_info_headeronly() to extract GOP metadata (POC, NAL
    type, reference POCs) for the most recently completed picture.
+   This mode is not reversible and must not be mixed with vvdec_decode(): after
+   the first call only vvdec_decode_headeronly() may be used until
+   vvdec_decoder_close() is called.
+   If accessUnit->payloadUsedSize is 0, no data is parsed and VVDEC_OK is
+   returned immediately (unlike vvdec_decode(), which signals VVDEC_EOF for an
+   empty access unit).
    \param[in]   vvdecDecoder pointer of decoder handler
    \param[in]   vvdecAccessUnit_t pointer of AccessUnit that retrieves compressed access units and side information
    \param[out]  vvdecFrame pointer to pointer of frame structure (always NULL)
