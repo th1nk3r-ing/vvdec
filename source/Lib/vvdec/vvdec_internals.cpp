@@ -116,7 +116,7 @@ int vvdec_internals_get_ctb_info_layout_dec( vvdecDecoder *dec,
   {
     return VVDEC_ERR_INITIALIZE;
   }
-  const vvdec::CodingStructure* cs = pic->cs;
+  const vvdec::CodingStructure* cs = pic->cs.get();
   const vvdec::PreCalcValues*   pcv = cs->pcv;
   if( !pcv )
   {
@@ -151,7 +151,7 @@ int vvdec_internals_get_ctb_slice_idx_dec( vvdecDecoder *dec,
   {
     return VVDEC_ERR_INITIALIZE;
   }
-  const vvdec::CodingStructure* cs = pic->cs;
+  const vvdec::CodingStructure* cs = pic->cs.get();
   const vvdec::PreCalcValues*   pcv = cs->pcv;
   if( !pcv )
   {
@@ -259,7 +259,7 @@ int vvdec_internals_get_cb_info_dec( vvdecDecoder *dec,
   {
     return VVDEC_ERR_INITIALIZE;
   }
-  const vvdec::CodingStructure* cs = pic->cs;
+  const vvdec::CodingStructure* cs = pic->cs.get();
   const vvdec::PreCalcValues*   pcv = cs->pcv;
   if( !pcv )
   {
@@ -324,7 +324,7 @@ int vvdec_internals_get_pb_info_dec( vvdecDecoder *dec,
   {
     return VVDEC_ERR_INITIALIZE;
   }
-  const vvdec::CodingStructure* cs = pic->cs;
+  const vvdec::CodingStructure* cs = pic->cs.get();
   const vvdec::PreCalcValues*   pcv = cs->pcv;
   if( !pcv )
   {
@@ -398,7 +398,7 @@ int vvdec_internals_get_intra_dir_info_dec( vvdecDecoder *dec,
   {
     return VVDEC_ERR_INITIALIZE;
   }
-  const vvdec::CodingStructure* cs = pic->cs;
+  const vvdec::CodingStructure* cs = pic->cs.get();
   const vvdec::PreCalcValues*   pcv = cs->pcv;
   if( !pcv )
   {
@@ -462,7 +462,7 @@ int vvdec_internals_get_tu_info_dec( vvdecDecoder *dec,
   {
     return VVDEC_ERR_INITIALIZE;
   }
-  const vvdec::CodingStructure* cs = pic->cs;
+  const vvdec::CodingStructure* cs = pic->cs.get();
   const vvdec::PreCalcValues*   pcv = cs->pcv;
   if( !pcv )
   {
