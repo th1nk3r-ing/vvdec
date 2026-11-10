@@ -82,7 +82,9 @@ void BinDecoder::start()
 {
   CHECK( m_Bitstream->getNumBitsUntilByteAligned(), "Bitstream is not byte aligned." );
   m_Range       = 510;
-  m_Value       = ( uint32_t( m_Bitstream->readByte() ) << 8 ) + m_Bitstream->readByte();
+  const uint32_t firstByte  = m_Bitstream->readByte();
+  const uint32_t secondByte = m_Bitstream->readByte();
+  m_Value       = ( firstByte << 8 ) + secondByte;
   m_bitsNeeded  = -8;
 }
 
